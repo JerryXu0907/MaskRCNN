@@ -31,7 +31,7 @@ class BuildDataset(torch.utils.data.Dataset):
         assert transed_img.shape == (3,800,1088)
         assert transed_bbox.shape[0] == transed_mask.shape[0]
 
-        
+
         return transed_img, label, transed_mask, transed_bbox, index
 
 
@@ -50,9 +50,9 @@ class BuildDataset(torch.utils.data.Dataset):
         assert bbox.shape[0] == mask.squeeze(0).shape[0]
 
         return img.squeeze(0), mask.squeeze(0), bbox
-    
 
-    
+
+
     def __len__(self):
         return len(self.imgs_data)
 
