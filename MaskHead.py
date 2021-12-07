@@ -5,19 +5,21 @@ import torch.nn.functional as F
 from torch import nn
 from utils import *
 
+
 class MaskHead(torch.nn.Module):
-    def __init__(self,Classes=3,P=14):
-        self.C=Classes
-        self.P=P
+    def __init__(self, Classes=3, P=14):
+        super(MaskHead, self).__init__()
+        self.C = Classes
+        self.P = P
         # TODO initialize MaskHead
         self.net = nn.Sequential(
-            nn.Conv2d(256, 256, 3, padding_mode='same'),
+            nn.Conv2d(256, 256, 3, padding='same'),
             nn.ReLU(),
-            nn.Conv2d(256, 256, 3, padding_mode='same'),
+            nn.Conv2d(256, 256, 3, padding='same'),
             nn.ReLU(),
-            nn.Conv2d(256, 256, 3, padding_mode='same'),
+            nn.Conv2d(256, 256, 3, padding='same'),
             nn.ReLU(),
-            nn.Conv2d(256, 256, 3, padding_mode='same'),
+            nn.Conv2d(256, 256, 3, padding='same'),
             nn.ReLU(),
             nn.ConvTranspose2d(256, 256, 2, stride=2),
             nn.ReLU(),
@@ -43,8 +45,9 @@ class MaskHead(torch.nn.Module):
     #       scores: list:len(bz){(post_NMS_boxes_per_image)}   ( the score for the top class for the regressed box)
     #       labels: list:len(bz){(post_NMS_boxes_per_image)}  (top category of each regressed box)
     #       gt_masks: list:len(bz){(post_NMS_boxes_per_image,2*P,2*P)}
-    def preprocess_ground_truth_creation(self, class_logits, box_regression, proposals, gt_labels, bbox ,masks , IOU_thresh=0.5, keep_num_preNMS=1000, keep_num_postNMS=100):
-        conf_thresh = 0.5 # this parameter is needed ?
+    def preprocess_ground_truth_creation(self, class_logits, box_regression, proposals, gt_labels, bbox, masks,
+                                         IOU_thresh=0.5, keep_num_preNMS=1000, keep_num_postNMS=100):
+        conf_thresh = 0.5  # this parameter is needed ?
         b = len(proposals)
         boxes = []
         scores = []
@@ -89,7 +92,6 @@ class MaskHead(torch.nn.Module):
                 if len(indices) == 0:
                     continue
                 box_list = list(range(len(indices)))
-                box_indices = deepcopy(indices)
                 left_index = []
                 while len(box_list) > 0:
                     l = box_list[0]
@@ -100,19 +102,27 @@ class MaskHead(torch.nn.Module):
                             remove_list.append(box_list[b])
                     for r in remove_list:
                         box_list.remove(r)
-                        box_indices = box_indices[torch.tensor(box_list)]
                     left_index.append(l)
-                    # assign gt mask to l
+                    # assign gt mask to l(a single box)
                     left_box = box[indices[l]]
-                    gt_indices = torch.nonzero(gt_labels[i]==c).squeeze(1)
+                    gt_indices = torch.nonzero(gt_labels[i] == c).squeeze(
+                        1)  # get gt indices based on the label of the left_box
                     if len(gt_indices) == 0:
-                        gt_masks_box = torch.zeros((self.P, self.P))
+                        gt_mask_perbox = torch.zeros((2*self.P, 2*self.P))
                     else:
-                        _, max_iou_bbox_idx = max_IOU(left_box, masks[i][gt_indices])
-                        gt_masks_box = masks[i][gt_indices[max_iou_bbox_idx]]
-                        gt_masks_box = gt_masks_box[left_box[0]:left_box[2], left_box[1]:left_box[3]]
-                        gt_masks_box = F.interpolate(gt_masks_box, size=(self.P, self.P))
-                    gt_masks_image.append(gt_masks_box)
+                        # choose the gt_box which has the max iou with the proposed box
+                        _, max_iou_bbox_idx = max_IOU(left_box.unsqueeze(0), bbox[i][gt_indices], xaya=True, xbyb=True)
+                        # get the mask
+                        gt_mask_perbox = masks[i][gt_indices[max_iou_bbox_idx]]
+                        # intersection of the mask and proposed box
+                        gt_mask_perbox = gt_mask_perbox[None, :, int(left_box[0]):int(left_box[2]),
+                                         int(left_box[1]):int(left_box[3])]
+                        # resize(Note interpolate only receive (bz, c, x, y) not (x, y))
+                        if gt_mask_perbox.shape[-1] == 0 or gt_mask_perbox.shape[-2] == 0:
+                            gt_mask_perbox = torch.zeros((2*self.P, 2*self.P))
+                        else:
+                            gt_mask_perbox = F.interpolate(gt_mask_perbox, size=(self.P, self.P))[0, 0]
+                    gt_masks_image.append(gt_mask_perbox.unsqueeze(0))  # (1, self.P, self.P)
                 left_indices.append(indices[left_index])
             if len(left_indices) == 0:
                 return [], [], []
@@ -133,12 +143,12 @@ class MaskHead(torch.nn.Module):
     #      input_list: list:len(bz){(dim1,?)}
     # Output:
     #      output_tensor: (sum_of_dim1,?)
-    def flatten_inputs(self,input_list):
+    def flatten_inputs(self, input_list):
         output_tensor = input_list[0]
         for input_tensor in input_list[1:]:
+            input_tensor = input_tensor
             output_tensor = torch.cat((output_tensor, input_tensor), dim=0)
         return output_tensor
-
 
     # This function does the post processing for the result of the Mask Head for a batch of images. It project the predicted mask
     # back to the original image size
@@ -150,7 +160,7 @@ class MaskHead(torch.nn.Module):
     #       image_size: tuple:len(2)
     # Output:
     #       projected_masks: list:len(bz){(post_NMS_boxes_per_image,image_size[0],image_size[1]
-    def postprocess_mask(self, masks_outputs, boxes, labels, image_size=(800,1088)):
+    def postprocess_mask(self, masks_outputs, boxes, labels, image_size=(800, 1088)):
         start = 0
         projected_masks = []
         for img_idx in range(len(boxes)):
@@ -158,12 +168,12 @@ class MaskHead(torch.nn.Module):
             boxes_num = boxes[img_idx].shape[0]
             img_bbox = boxes[img_idx]
             img_labels = labels[img_idx]
-            img_masks = masks_outputs[start:start+boxes_num]
+            img_masks = masks_outputs[start:start + boxes_num]
             start += boxes_num
             for bbox, idx in zip(img_bbox, range(boxes_num)):
                 mask = img_masks[idx][img_labels[idx]]
-                mask = F.interpolate(mask, size=(bbox[2]-bbox[0], bbox[3]-bbox[1]))
-                project_mask = torch.zeros((image_size[0],image_size[1]))
+                mask = F.interpolate(mask, size=(bbox[2] - bbox[0], bbox[3] - bbox[1]))
+                project_mask = torch.zeros((image_size[0], image_size[1]))
                 project_mask[bbox[0]:bbox[2], bbox[1]:bbox[3]] = mask
                 img_projected_masks.append(project_mask)
             projected_masks.append(self.flatten_inputs(img_projected_masks))
@@ -176,12 +186,16 @@ class MaskHead(torch.nn.Module):
     #      gt_masks: (total_boxes,2*P,2*P)
     # Output:
     #      mask_loss
-    def compute_loss(self,mask_output,labels,gt_masks):
+    def compute_loss(self, mask_output, labels, gt_masks):
+        # suppose the lable 0 is for bg
+        # the total_boxes means the boxes after NMS?
         mask_loss = 0
         loss = nn.BCELoss(reduction='sum')
         for c in range(self.C):
-            cls = c+1
-            cls_idx = torch.nonzero(labels==cls).squeeze(1)
+            cls = c + 1
+            cls_idx = torch.nonzero(labels == cls)[:, 0]
+            if len(cls_idx) == 0:
+                continue
             cls_masks = mask_output[cls_idx][:, c, ...]
             gt_cls_masks = gt_masks[cls_idx]
             mask_loss += loss(cls_masks, gt_cls_masks)
@@ -196,4 +210,39 @@ class MaskHead(torch.nn.Module):
         mask_outputs = self.net(features)
         return mask_outputs
 
+
 if __name__ == '__main__':
+    mask_head = MaskHead()
+    # Input:
+    #       class_logits: (total_proposals,(C+1))
+    #       box_regression: (total_proposal,4*C)  ([t_x,t_y,t_w,t_h])
+    #       proposals: list:len(bz){(per_image_proposals,4)} ([x1,y1,x2,y2] format)   ——[from rpn]
+    #       gt_labels: list:len(bz) {(n_obj)}
+    #       bbox: list:len(bz){(n_obj, 4)}
+    #       masks: list:len(bz){(n_obj,800,1088)}
+    #       IOU_thresh: scalar (threshold to filter regressed with low IOU with a bounding box)
+    #       keep_num_preNMS: scalar (number of boxes to keep pre NMS)
+    #       keep_num_postNMS: scalar (number of boxes to keep post NMS)
+    # Output:
+    #       boxes: list:len(bz){(post_NMS_boxes_per_image,4)} ([x1,y1,x2,y2] format)
+    #       scores: list:len(bz){(post_NMS_boxes_per_image)}   ( the score for the top class for the regressed box)
+    #       labels: list:len(bz){(post_NMS_boxes_per_image)}  (top category of each regressed box)
+    #       gt_masks: list:len(bz){(post_NMS_boxes_per_image,2*P,2*P)}
+    class_logits = torch.randn((10, 4)) + 0.2
+    box_regression = torch.randn((10, 4 * 3))
+    proposals = [torch.randint(0, 100, (4, 4)).sort(dim=1, descending=False)[0],
+                 torch.randint(0, 100, (6, 4)).sort(dim=1, descending=False)[0]]
+    gt_labels = [torch.tensor([1, 2]), torch.tensor([1])]
+    bbox = [torch.tensor([[0, 0, 50, 50], [25, 25, 75, 75]]), torch.tensor([[25, 25, 75, 75]])]
+    masks = [torch.ones((2, 800, 1088)), torch.ones((1, 800, 1088))]
+    boxes, scores, labels, gt_masks = mask_head.preprocess_ground_truth_creation(class_logits, box_regression,
+                                                                                 proposals, gt_labels, bbox, masks,
+                                                                                 IOU_thresh=0.5, keep_num_preNMS=1000,
+                                                                                 keep_num_postNMS=100)
+
+    print(gt_masks[0].shape)
+    features = torch.randn((10, 256, 14, 14))
+    mask_output = mask_head(features)
+    total_boxes_num = len(gt_masks)
+    propose_labels = torch.ones((total_boxes_num, 1))
+    mask_head.compute_loss(mask_output=mask_output[:total_boxes_num], labels=propose_labels, gt_masks=mask_head.flatten_inputs(gt_masks))

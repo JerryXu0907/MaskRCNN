@@ -68,6 +68,38 @@ def single_IOU(boxA, boxB, xaya=False, xbyb=False):
     iou = iou / ((x2-x1) * (y2-y1) + (x4-x3) * (y4-y3) - iou)
     return iou
 
+
+def max_IOU(boxA, boxB, xaya=False, xbyb=False):
+    append_boxA = boxA.unsqueeze(1).repeat(1, len(boxB), 1)
+    append_boxB = boxB.unsqueeze(0).repeat(len(boxA), 1, 1)
+    if xaya:
+        x1 = append_boxA[..., 0]
+        x2 = append_boxA[..., 2]
+        y1 = append_boxA[..., 1]
+        y2 = append_boxA[..., 3]
+    else:
+        x1 = append_boxA[..., 0] - append_boxA[..., 2] / 2
+        x2 = append_boxA[..., 0] + append_boxA[..., 2] / 2
+        y1 = append_boxA[..., 1] - append_boxA[..., 3] / 2
+        y2 = append_boxA[..., 1] + append_boxA[..., 3] / 2
+
+    if xbyb:
+        x3 = append_boxB[..., 0]
+        x4 = append_boxB[..., 2]
+        y3 = append_boxB[..., 1]
+        y4 = append_boxB[..., 3]
+    else:
+        x3 = append_boxB[..., 0] - append_boxB[..., 2] / 2
+        x4 = append_boxB[..., 0] + append_boxB[..., 2] / 2
+        y3 = append_boxB[..., 1] - append_boxB[..., 3] / 2
+        y4 = append_boxB[..., 1] + append_boxB[..., 3] / 2
+    iou = torch.clip(torch.min(x4, x2) - torch.max(x1, x3), 0) * torch.clip(torch.min(y4, y2) - torch.max(y1, y3), 0)
+    iou = iou / ((x2 - x1) * (y2 - y1) + (x4 - x3) * (y4 - y3) - iou)
+    max_iou, max_iou_idx = torch.max(iou, dim=1)
+    return max_iou, max_iou_idx
+
+
+
 # This function flattens the output of the network and the corresponding anchors 
 # in the sense that it concatenates  the outputs and the anchors from all the grid cells
 # from all the images into 2D matrices

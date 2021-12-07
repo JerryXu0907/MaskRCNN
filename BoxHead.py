@@ -6,6 +6,7 @@ import torchvision
 
 class BoxHead(torch.nn.Module):
     def __init__(self,Classes=3,P=7):
+        super(BoxHead, self).__init__()
         self.C=Classes
         self.P=P
         # TODO initialize BoxHead
