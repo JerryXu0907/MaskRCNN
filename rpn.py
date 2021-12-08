@@ -311,6 +311,16 @@ class RPNHead(torch.nn.Module):
                 mbatch_regr_out = regr_out[pos_targ]
                 mbatch_clas_out_pos = clas_out[pos_targ]
                 mbatch_clas_out_neg = clas_out[neg_targ[neg_targ_sampleidx]]
+
+            elif neg_targ.shape[0] < effective_batch // 2:
+                # no enough pos samples
+                pos_targ_sampleidx = np.random.choice(a=pos_targ.shape[0], size=effective_batch - neg_targ.shape[0],
+                                                    replace=False)
+                mbatch_targ_regr = targ_regr[pos_targ]
+                mbatch_regr_out = regr_out[pos_targ]
+                mbatch_clas_out_pos = clas_out[pos_targ[pos_targ_sampleidx]]
+                mbatch_clas_out_neg = clas_out[neg_targ]
+                
             else:
                 pos_sample = effective_batch // 2
                 neg_sample = effective_batch - pos_sample

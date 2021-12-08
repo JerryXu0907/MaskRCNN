@@ -165,6 +165,7 @@ class MaskHead(torch.nn.Module):
         projected_masks = []
         for img_idx in range(len(boxes)):
             img_projected_masks = []
+            # TODO: need to get the int(boxes[0])
             boxes_num = boxes[img_idx].shape[0]
             img_bbox = boxes[img_idx]
             img_labels = labels[img_idx]

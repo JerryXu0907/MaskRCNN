@@ -66,7 +66,7 @@ def main():
         loss_r_val += loss_r
         val_loss_mean = np.mean(np.array(loss_total))
         print("Epoch {} Validation Loss Mean: {:.4f}".format(i, val_loss_mean))
-        if i > 25:
+        if i > 5:
             if val_loss_mean < best_loss:
                 best_loss = val_loss_mean
                 early_stopping = 0
