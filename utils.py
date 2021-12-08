@@ -100,26 +100,29 @@ def max_IOU(boxA, boxB, xaya=False, xbyb=False):
 
 
 
-# This function flattens the output of the network and the corresponding anchors 
-# in the sense that it concatenates  the outputs and the anchors from all the grid cells
-# from all the images into 2D matrices
-# Each row of the 2D matrices corresponds to a specific anchor/grid cell
+# This function flattens the output of the network and the corresponding anchors
+# in the sense that it concatenate  the outputs and the anchors from all the grid cells from all
+# the FPN levels from all the images into 2D matrices
+# Each row correspond of the 2D matrices corresponds to a specific grid cell
 # Input:
-#       out_r: (4,grid_size[0],grid_size[1])
-#       out_c: (1,grid_size[0],grid_size[1])
-#       anchors: (grid_size[0],grid_size[1],4)
+#       out_r: list:len(FPN){(bz,num_anchors*4,grid_size[0],grid_size[1])}
+#       out_c: list:len(FPN){(bz,num_anchors*1,grid_size[0],grid_size[1])}
+#       anchors: list:len(FPN){(num_anchor, grid_size[0], grid_size[1], 4)}
 # Output:
-#       flatten_regr: (grid_size[0]*grid_size[1],4)
-#       flatten_clas: (grid_size[0]*grid_size[1])
-#       flatten_anchors: (grid_size[0]*grid_size[1],4)
+#       flatten_regr: (total_number_of_anchors*bz,4)
+#       flatten_clas: (total_number_of_anchors*bz)
+#       flatten_anchors: (total_number_of_anchors*bz,4)
 def output_flattening(out_r,out_c,anchors):
     #######################################
     # TODO flatten the output tensors and anchors
     #######################################
-    assert len(out_r.shape) == 3
-    flatten_regr = out_r.permute(1, 2, 0).view(-1, 4)
-    flatten_clas = out_c.squeeze().view(-1)
-    flatten_anchors = anchors.view(-1, 4)
+    bz= len(out_c[0])
+    out_r = torch.cat([i.permute(0, 2, 3, 1).view(bz, -1, 4) for i in out_r], dim=1)
+    out_c = torch.cat([i.permute(0, 2, 3, 1).view(bz, -1) for i in out_c], dim=1)
+    anchors = torch.cat([i.permute(1, 2, 0, 3).view(-1, 4) for i in anchors], dim=0)
+    flatten_regr = out_r.view(-1, 4)
+    flatten_clas = out_c.view(-1)
+    flatten_anchors = anchors.unsqueeze(0).repeat(bz, 1, 1).view(-1, 4)
     return flatten_regr, flatten_clas, flatten_anchors
 
 # This function decodes the output that is given in the encoded format (defined in the handout)

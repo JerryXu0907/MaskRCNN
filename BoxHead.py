@@ -146,8 +146,6 @@ class BoxHead(torch.nn.Module):
         return boxes, scores, labels
 
 
-
-
     # Compute the total loss of the classifier and the regressor
     # Input:
     #      class_logits: (total_proposals,(C+1)) (as outputed from forward, not passed from softmax so we can use CrossEntropyLoss)

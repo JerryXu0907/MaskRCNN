@@ -58,6 +58,7 @@ class BuildDataset(torch.utils.data.Dataset):
             else:
                 res_masks = torch.vstack([res_masks, self.mask_transform(mask)])
         bbox = self.bbox[idx] * self.imageScale
+        # xywh style bounding box
         bbox = np.stack([bbox[:, 0]/2 + bbox[:, 2]/2, bbox[:, 1]/2 + bbox[:, 3]/2, bbox[:, 2]-bbox[:, 0], bbox[:, 3]-bbox[:, 1]], axis=-1)
         bbox = torch.tensor(bbox)
         label = torch.tensor(self.label[idx], requires_grad=False)

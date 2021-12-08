@@ -22,7 +22,8 @@ def Resnet50Backbone(checkpoint_file=None, device="cpu", eval=True):
 
 if __name__ == '__main__':
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    resnet50_fpn = Resnet50Backbone()
+    resnet50_fpn = Resnet50Backbone(device=device)
+    # resnet50_fpn = resnet50_fpn.to(device)
     # backbone = Resnet50Backbone('checkpoint680.pth')
     E = torch.ones([2,3,800,1088], device=device)
     backout = resnet50_fpn(E)
@@ -32,4 +33,5 @@ if __name__ == '__main__':
     print(backout["2"].shape)
     print(backout["3"].shape)
     print(backout["pool"].shape)
+    x = input()
 
