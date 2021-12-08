@@ -138,8 +138,8 @@ class RPNHead(torch.nn.Module):
     #      ground_coord: list:len(FPN){(bz,4*num_anchors,grid_size[0],grid_size[1])}
     def create_batch_truth(self, bboxes_list, indexes, image_shape):
         bz = len(bboxes_list)
-        ground = [[]] * self.len_fpn
-        ground_coord = [[]] * self.len_fpn
+        ground = [[], [], [], [], []]
+        ground_coord = [[], [], [], [], []]
         for i in range(bz):
             gt_clas, gt_coord = self.create_ground_truth(bboxes_list[i], 
                                                          indexes[i], 
@@ -149,8 +149,8 @@ class RPNHead(torch.nn.Module):
             for t in range(self.len_fpn):
                 ground[t].append(gt_clas[t])
                 ground_coord[t].append(gt_coord[t])
-        ground = [torch.stack(i) for i in ground]
-        ground_coord = [torch.stack(i) for i in ground_coord]
+        ground = [torch.stack(i).to(self.device) for i in ground]
+        ground_coord = [torch.stack(i).to(self.device) for i in ground_coord]
         return ground, ground_coord
 
     # This function create the ground truth for one image for all the FPN levels
@@ -176,16 +176,17 @@ class RPNHead(torch.nn.Module):
         gt_coord_list = []
         gt_clas_list = []
         for i in range(len(anchors)):
-            num_anchors = len(anchors[i])
+            anch = anchors[i]
+            num_anchors = len(anch)
             S_y, S_x = grid_sizes[i]
             h_grid, w_grid = H // S_y, W // S_x
-            w_a = anchors[i][:,0, 0, 2] # num_anchors
-            h_a = anchors[i][:,0, 0, 3] # num_anchors
+            w_a = anch[:,0, 0, 2] # num_anchors
+            h_a = anch[:,0, 0, 3] # num_anchors
 
             # calculate the cutoff index for the grids in which the anchor cross
             # the boundary
-            h_cutoff = int((h_a / 2 - h_grid / 2) // h_grid)
-            w_cutoff = int((w_a / 2 - w_grid / 2) // w_grid)
+            h_cutoff = ((h_a / 2 - h_grid / 2) // h_grid).to(torch.int)
+            w_cutoff = ((w_a / 2 - w_grid / 2) // w_grid).to(torch.int)
             ignore_mask = torch.ones(num_anchors, S_y, S_x)
             for n in range(num_anchors):
                 if h_cutoff[n] >= 0:
@@ -196,7 +197,7 @@ class RPNHead(torch.nn.Module):
                     ignore_mask[n, :, -w_cutoff[n] - 1:] = 0.
 
             # mask-out the cross boundary anchors
-            new_anchors = ignore_mask.unsqueeze(-1) * anchors
+            new_anchors = ignore_mask.unsqueeze(-1) * anch
 
             new_anchors = new_anchors.view(-1, 4) # num_a * g0 * g1, 4
             iou = IOU(new_anchors, bboxes) # num_a*g0*g1, n_boxes
@@ -234,12 +235,10 @@ class RPNHead(torch.nn.Module):
             ground_clas = pos_labels.int() - neg_labels.int()
 
             # reshape
-            ground_coord = ground_coord.view(num_anchors, S_y, S_x, 4).permute(3, 0, 1, 2).view(-1, S_y, S_x)
+            ground_coord = ground_coord.view(num_anchors, S_y, S_x, 4).permute(0, 3, 1, 2).reshape(-1, S_y, S_x)
             ground_clas = ground_clas.view(num_anchors, S_y, S_x) * ignore_mask
             gt_coord_list.append(ground_coord)
             gt_clas_list.append(ground_clas)
-            assert ground_clas.shape==(3,grid_sizes[i][0],grid_sizes[i][1])
-            assert ground_coord.shape==(4*3,grid_sizes[i][0],grid_sizes[i][1])
 
         self.ground_dict[key] = (gt_clas_list, gt_coord_list)
 
