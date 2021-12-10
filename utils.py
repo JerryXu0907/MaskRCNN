@@ -117,9 +117,9 @@ def output_flattening(out_r,out_c,anchors):
     # TODO flatten the output tensors and anchors
     #######################################
     bz= len(out_c[0])
-    out_r = torch.cat([i.permute(0, 2, 3, 1).view(bz, -1, 4) for i in out_r], dim=1)
-    out_c = torch.cat([i.permute(0, 2, 3, 1).view(bz, -1) for i in out_c], dim=1)
-    anchors = torch.cat([i.permute(1, 2, 0, 3).view(-1, 4) for i in anchors], dim=0)
+    out_r = torch.cat([i.permute(0, 2, 3, 1).reshape(bz, -1, 4) for i in out_r], dim=1)
+    out_c = torch.cat([i.permute(0, 2, 3, 1).reshape(bz, -1) for i in out_c], dim=1)
+    anchors = torch.cat([i.permute(1, 2, 0, 3).reshape(-1, 4) for i in anchors], dim=0)
     flatten_regr = out_r.view(-1, 4)
     flatten_clas = out_c.view(-1)
     flatten_anchors = anchors.unsqueeze(0).repeat(bz, 1, 1).view(-1, 4)
@@ -164,3 +164,10 @@ def output_decodingd(regressed_boxes_t, flatten_proposals, device='cpu'):
     h = h_p * torch.exp(regressed_boxes_t[:, 3])
     box = torch.stack([x - w/2, y - h/2, x + w/2, y + h/2], dim=1)
     return box
+
+def flat_anchors(anchors):
+    new_anchors = []
+    for i in range(len(anchors)):
+        new_anchors.append(anchors[i].clone().reshape(-1, 4)) #n*g[0]*g[1], 4
+    new_anchors = torch.cat(new_anchors, dim=0)
+    return new_anchors

@@ -3,7 +3,6 @@ import torch
 from torchvision import transforms
 from torch.nn import functional as F
 from torch import nn, Tensor
-from dataset import *
 from utils import *
 import torchvision
 from backbone import Resnet50Backbone
@@ -21,8 +20,8 @@ class RPNHead(torch.nn.Module):
                                     scale=[32, 64, 128, 256, 512],
                                     grid_size=[(200, 272), (100, 136), (50, 68), (25, 34), (13, 17)],
                                     stride=[4, 8, 16, 32, 64]),
-                #  freeze_backbone=True,
-                #  backbone_ckpt=None
+                 freeze_backbone=False,
+                 backbone_ckpt=None
                  ):
         ######################################
         # TODO initialize RPN
@@ -37,7 +36,7 @@ class RPNHead(torch.nn.Module):
         for i in range(self.len_fpn):
             self.total_anchors += self.anchors_param['grid_size'][i][0] * self.anchors_param['grid_size'][i][1] * 3
         
-        # self.backbone = Resnet50Backbone(checkpoint_file=backbone_ckpt, device=device, eval=freeze_backbone)
+        self.backbone = Resnet50Backbone(checkpoint_file=backbone_ckpt, device=device, eval=freeze_backbone)
         self.intermediate = nn.Sequential(nn.Conv2d(in_channels, in_channels, 3, padding="same"),
                                           nn.BatchNorm2d(in_channels),
                                           nn.ReLU()).to(device)
@@ -57,7 +56,8 @@ class RPNHead(torch.nn.Module):
     # Ouput:
     #       logits: list:len(FPN){(bz,1*num_anchors,grid_size[0],grid_size[1])}
     #       bbox_regs: list:len(FPN){(bz,4*num_anchors, grid_size[0],grid_size[1])}
-    def forward(self, X):
+    def forward(self, img):
+        X = self.backbone(img)
         logits = []
         bbox_regs = []
         for i in range(self.len_fpn):
@@ -65,6 +65,25 @@ class RPNHead(torch.nn.Module):
             logits.append(logit)
             bbox_regs.append(reg)
         return logits, bbox_regs
+    
+    def forward_test(self, X):
+        logits = []
+        bbox_regs = []
+        for i in range(self.len_fpn):
+            logit, reg = self.forward_single(X[self.backbone_keys[i]])
+            logits.append(logit)
+            bbox_regs.append(reg)
+        sorted_clas_list, sorted_coord_list = self.postprocess(logits, bbox_regs,keep_num_postNMS=200)#  ,keep_preNMS=True)
+        new_coord_list = []
+        for i in range(len(sorted_coord_list)):
+            coords = sorted_coord_list[i]
+            xaya_coords = torch.zeros_like(coords)
+            xaya_coords[..., 0] = coords[..., 0] - coords[..., 2] / 2
+            xaya_coords[..., 1] = coords[..., 1] - coords[..., 3] / 2
+            xaya_coords[..., 2] = coords[..., 0] + coords[..., 2] / 2
+            xaya_coords[..., 3] = coords[..., 1] + coords[..., 3] / 2
+            new_coord_list.append(xaya_coords)
+        return sorted_clas_list, new_coord_list
 
     # Forward a single level of the FPN output through the intermediate layer and the RPN heads
     # Input:
@@ -175,70 +194,67 @@ class RPNHead(torch.nn.Module):
         H, W = image_size
         gt_coord_list = []
         gt_clas_list = []
+
+        flatten_anchors = flat_anchors(anchors)
+        ground_clas = torch.zeros(flatten_anchors.shape[0], 1)
+        ground_coord = torch.zeros_like(flatten_anchors)
+        x1 = flatten_anchors[:, 0] - flatten_anchors[:, 2] / 2.0
+        y1 = flatten_anchors[:, 1] - flatten_anchors[:, 3] / 2.0
+        x2 = flatten_anchors[:, 0] + flatten_anchors[:, 2] / 2.0
+        y2 = flatten_anchors[:, 1] + flatten_anchors[:, 3] / 2.0
+        inside_idx = torch.where((x1 >= 0) & (y1 >= 0) & (x2 < image_size[1]) & (y2 < image_size[0]))
+        iou_mat = IOU(flatten_anchors[inside_idx], bboxes)
+        max_iou_box, _ = torch.max(iou_mat, dim=0)
+        inside_idx = inside_idx[0]
+        max_ious, max_iou_idxes = torch.max(iou_mat, dim=1)
+        pos_idx = inside_idx[torch.where(max_ious > 0.7)]
+        pos_box_idx = max_iou_idxes[torch.where(max_ious > 0.7)]
+        neg_idx = inside_idx[torch.where(max_ious < 0.3)]
+
+        for idx, box_idx in zip(pos_idx, pos_box_idx):
+            i = idx.item()
+            k = box_idx.item()
+            ground_clas[i, 0] = 1
+
+            x,y,w,h = bboxes[k]
+            
+            xa, ya, wa, ha = flatten_anchors[i]
+            
+            ground_coord[i, 0] = (x - xa) / wa
+            ground_coord[i, 1] = (y - ya) / ha
+            ground_coord[i, 2] = torch.log(w / wa)
+            ground_coord[i, 3] = torch.log(h / ha)
+        
+        # negative label with IOU < 0.3
+        ground_clas[neg_idx] = -1
+
+        # positive label with highest IOU
+        for k in range(bboxes.shape[0]):
+            max_iou_box_idx = inside_idx[torch.where(torch.isclose(iou_mat[:, k], max_iou_box[k]))[0]]
+
+            ground_clas[max_iou_box_idx] = 1
+            one_idx = torch.ones_like(max_iou_box_idx)
+
+            x,y,w,h = bboxes[k]
+            
+            xa, ya, wa, ha = flatten_anchors[max_iou_box_idx][:, 0], flatten_anchors[max_iou_box_idx][:, 1], flatten_anchors[max_iou_box_idx][:, 2], flatten_anchors[max_iou_box_idx][:, 3]
+            
+            ground_coord[(max_iou_box_idx, one_idx * 0)] = (x - xa) / wa
+            ground_coord[(max_iou_box_idx, one_idx * 1)] = (y - ya) / ha
+            ground_coord[(max_iou_box_idx, one_idx * 2)] = torch.log(w / wa)
+            ground_coord[(max_iou_box_idx, one_idx * 3)] = torch.log(h / ha)
+        
+        start = 0
         for i in range(len(anchors)):
-            anch = anchors[i]
-            num_anchors = len(anch)
-            S_y, S_x = grid_sizes[i]
-            h_grid, w_grid = H // S_y, W // S_x
-            w_a = anch[:,0, 0, 2] # num_anchors
-            h_a = anch[:,0, 0, 3] # num_anchors
-
-            # calculate the cutoff index for the grids in which the anchor cross
-            # the boundary
-            h_cutoff = ((h_a / 2 - h_grid / 2) // h_grid).to(torch.int)
-            w_cutoff = ((w_a / 2 - w_grid / 2) // w_grid).to(torch.int)
-            ignore_mask = torch.ones(num_anchors, S_y, S_x)
-            for n in range(num_anchors):
-                if h_cutoff[n] >= 0:
-                    ignore_mask[n, :h_cutoff[n] + 1] = 0.
-                    ignore_mask[n, -h_cutoff[n] - 1:] = 0.
-                if w_cutoff[n] >= 0:
-                    ignore_mask[n, :, :w_cutoff[n] + 1] = 0.
-                    ignore_mask[n, :, -w_cutoff[n] - 1:] = 0.
-
-            # mask-out the cross boundary anchors
-            new_anchors = ignore_mask.unsqueeze(-1) * anch
-
-            new_anchors = new_anchors.view(-1, 4) # num_a * g0 * g1, 4
-            iou = IOU(new_anchors, bboxes) # num_a*g0*g1, n_boxes
-            max_box_indices = torch.argmax(iou, dim=1)
-            pos_labels = torch.zeros(new_anchors.shape[0])
-
-            # record the indices of the anchors that has the largest iou
-            # for each bounding box
-            highest_iou, _ = torch.max(iou, dim=0)
-            for i in range(len(highest_iou)):
-                pos_labels += (iou[:, i] == highest_iou[i])
-            
-            # record the anchors that has iou with bbox larger than 0.7
-            iou_over7 = 1 - torch.prod(iou <= 0.7, dim=1)
-
-            # get the positive labels and corresponding anchor box indices
-            pos_labels = (pos_labels + iou_over7) > 0
-            pos_indices = torch.nonzero(pos_labels).squeeze(1)
-
-            # calculate the regressor groundtruth for each positive anchor box
-            ground_coord = torch.zeros_like(new_anchors)
-            for i in pos_indices:
-                t_x_star = (bboxes[max_box_indices[i], 0] - new_anchors[i, 0]) / new_anchors[i, 2]
-                t_y_star = (bboxes[max_box_indices[i], 1] - new_anchors[i, 1]) / new_anchors[i, 3]
-                t_w_star = torch.log(bboxes[max_box_indices[i], 2] / new_anchors[i, 2])
-                t_h_star = torch.log(bboxes[max_box_indices[i], 3] / new_anchors[i, 3])
-                ground_coord[i] = torch.tensor([t_x_star, t_y_star, t_w_star, t_h_star])
-            
-            # record all non_positive anchor boxes
-            neg_labels = ~pos_labels
-            # record anchor boxes with all iou < 0.3
-            iou_below3 = torch.prod(iou < 0.3, dim=1)
-            neg_labels = neg_labels * iou_below3
-            # 1 positive, -1 negative, 0 ignore
-            ground_clas = pos_labels.int() - neg_labels.int()
-
-            # reshape
-            ground_coord = ground_coord.view(num_anchors, S_y, S_x, 4).permute(0, 3, 1, 2).reshape(-1, S_y, S_x)
-            ground_clas = ground_clas.view(num_anchors, S_y, S_x) * ignore_mask
-            gt_coord_list.append(ground_coord)
-            gt_clas_list.append(ground_clas)
+            level_cnt = self.num_anchors * grid_sizes[i][0] * grid_sizes[i][1]
+            level_gt_coord = ground_coord[start: start + level_cnt]
+            level_gt_clas = ground_clas[start: start + level_cnt]
+            level_gt_coord = level_gt_coord.reshape(self.num_anchors, grid_sizes[i][0] , grid_sizes[i][1], 4)
+            level_gt_coord = level_gt_coord.permute(0, 3, 1, 2).reshape(-1, grid_sizes[i][0] , grid_sizes[i][1])
+            level_gt_clas = level_gt_clas.reshape(self.num_anchors, grid_sizes[i][0], grid_sizes[i][1])
+            gt_coord_list.append(level_gt_coord)
+            gt_clas_list.append(level_gt_clas)
+            start += level_cnt
 
         self.ground_dict[key] = (gt_clas_list, gt_coord_list)
 
@@ -281,13 +297,14 @@ class RPNHead(torch.nn.Module):
     #       loss: scalar
     #       loss_c: scalar
     #       loss_r: scalar
-    def compute_loss(self, clas_out_list, regr_out_list, targ_clas_list, targ_regr_list, l=1, effective_batch=150):
+    def compute_loss(self, clas_out_list, regr_out_list, targ_clas_list, targ_regr_list, l=1, effective_batch=50):
         total_loss, total_loss_c, total_loss_r = 0., 0., 0.
         for n in range(self.len_fpn):
             clas_out = clas_out_list[n]
             regr_out = regr_out_list[n]
             targ_clas = targ_clas_list[n]
             targ_regr = targ_regr_list[n]
+            N_reg = clas_out.shape[-1] * clas_out.shape[-2]
             clas_out = clas_out.permute(0, 2, 3, 1).reshape(-1, 1)
             regr_out = regr_out.permute(0, 2, 3, 1).reshape(-1, 4*3).reshape(-1, 4)
             targ_clas = targ_clas.permute(0, 2, 3, 1).reshape(-1, 1)
@@ -295,46 +312,48 @@ class RPNHead(torch.nn.Module):
 
             pos_targ = torch.nonzero(targ_clas == 1)[:, 0]  # pos targ index, 1d
             neg_targ = torch.nonzero(targ_clas == -1)[:, 0]  # neg targ index, 1d
+            if self.training:
+                if pos_targ.shape[0] + neg_targ.shape[0] < effective_batch:
+                    # no enough samples
+                    mbatch_targ_regr = targ_regr[pos_targ]
+                    mbatch_regr_out = regr_out[pos_targ]
+                    mbatch_clas_out_pos = clas_out[pos_targ]
+                    mbatch_clas_out_neg = clas_out[neg_targ]
 
-            if pos_targ.shape[0] + neg_targ.shape[0] < effective_batch:
-                # no enough samples
-                mbatch_targ_regr = targ_regr[pos_targ]
-                mbatch_regr_out = regr_out[pos_targ]
-                mbatch_clas_out_pos = clas_out[pos_targ]
-                mbatch_clas_out_neg = clas_out[neg_targ]
+                elif pos_targ.shape[0] < effective_batch // 2:
+                    # no enough pos samples
+                    neg_targ_sampleidx = np.random.choice(a=neg_targ.shape[0], size=effective_batch - pos_targ.shape[0],
+                                                        replace=False)
+                    mbatch_targ_regr = targ_regr[pos_targ]
+                    mbatch_regr_out = regr_out[pos_targ]
+                    mbatch_clas_out_pos = clas_out[pos_targ]
+                    mbatch_clas_out_neg = clas_out[neg_targ[neg_targ_sampleidx]]
 
-            elif pos_targ.shape[0] < effective_batch // 2:
-                # no enough pos samples
-                neg_targ_sampleidx = np.random.choice(a=neg_targ.shape[0], size=effective_batch - pos_targ.shape[0],
-                                                    replace=False)
-                mbatch_targ_regr = targ_regr[pos_targ]
-                mbatch_regr_out = regr_out[pos_targ]
-                mbatch_clas_out_pos = clas_out[pos_targ]
-                mbatch_clas_out_neg = clas_out[neg_targ[neg_targ_sampleidx]]
+                elif neg_targ.shape[0] < effective_batch // 2:
+                    # no enough pos samples
+                    pos_targ_sampleidx = np.random.choice(a=pos_targ.shape[0], size=effective_batch - neg_targ.shape[0],
+                                                        replace=False)
+                    mbatch_targ_regr = targ_regr[pos_targ]
+                    mbatch_regr_out = regr_out[pos_targ]
+                    mbatch_clas_out_pos = clas_out[pos_targ[pos_targ_sampleidx]]
+                    mbatch_clas_out_neg = clas_out[neg_targ]
+                    
+                else:
+                    pos_sample = effective_batch // 2
+                    neg_sample = effective_batch - pos_sample
+                    pos_targ_sampleidx = np.random.choice(a=pos_targ.shape[0], size=pos_sample, replace=False)
+                    neg_targ_sampleidx = np.random.choice(a=neg_targ.shape[0], size=neg_sample, replace=False)
+                    mbatch_targ_regr = targ_regr[pos_targ[pos_targ_sampleidx]]
+                    mbatch_regr_out = regr_out[pos_targ[pos_targ_sampleidx]]
+                    mbatch_clas_out_pos = clas_out[pos_targ[pos_targ_sampleidx]]
+                    mbatch_clas_out_neg = clas_out[neg_targ[neg_targ_sampleidx]]
 
-            elif neg_targ.shape[0] < effective_batch // 2:
-                # no enough pos samples
-                pos_targ_sampleidx = np.random.choice(a=pos_targ.shape[0], size=effective_batch - neg_targ.shape[0],
-                                                    replace=False)
-                mbatch_targ_regr = targ_regr[pos_targ]
-                mbatch_regr_out = regr_out[pos_targ]
-                mbatch_clas_out_pos = clas_out[pos_targ[pos_targ_sampleidx]]
-                mbatch_clas_out_neg = clas_out[neg_targ]
-                
+                loss_c, sum_count_c = self.loss_class(mbatch_clas_out_pos, mbatch_clas_out_neg)
+                loss_r, sum_count_r = self.loss_reg(mbatch_targ_regr, mbatch_regr_out)
             else:
-                pos_sample = effective_batch // 2
-                neg_sample = effective_batch - pos_sample
-                pos_targ_sampleidx = np.random.choice(a=pos_targ.shape[0], size=pos_sample, replace=False)
-                neg_targ_sampleidx = np.random.choice(a=neg_targ.shape[0], size=neg_sample, replace=False)
-                mbatch_targ_regr = targ_regr[pos_targ[pos_targ_sampleidx]]
-                mbatch_regr_out = regr_out[pos_targ[pos_targ_sampleidx]]
-                mbatch_clas_out_pos = clas_out[pos_targ[pos_targ_sampleidx]]
-                mbatch_clas_out_neg = clas_out[neg_targ[neg_targ_sampleidx]]
-
-            # minibatch_targ_regr (M, 4)
-            loss_c, sum_count_c = self.loss_class(mbatch_clas_out_pos, mbatch_clas_out_neg)
-            loss_r, sum_count_r = self.loss_reg(mbatch_targ_regr, mbatch_regr_out)
-            loss = loss_c / sum_count_c + l * loss_r / 3400
+                loss_c, sum_count_c = self.loss_class(clas_out[pos_targ], clas_out[neg_targ])
+                loss_r, sum_count_r = self.loss_reg(targ_regr[pos_targ], regr_out[pos_targ])
+            loss = loss_c / sum_count_c + l * loss_r / N_reg
             total_loss += loss
             total_loss_c += loss_c
             total_loss_r += loss_r
@@ -351,17 +370,22 @@ class RPNHead(torch.nn.Module):
     # Output:
     #       nms_clas_list: list:len(bz){(Post_NMS_boxes)} (the score of the boxes that the NMS kept)
     #       nms_prebox_list: list:len(bz){(Post_NMS_boxes,4)} (the coordinate of the boxes that the NMS kept)
-    def postprocess(self, out_c, out_r, IOU_thresh=0.5, keep_num_preNMS=500, keep_num_postNMS=3):
+    def postprocess(self, out_c, out_r, IOU_thresh=0.5, keep_num_preNMS=500, keep_num_postNMS=200, keep_preNMS=False):
         bz = len(out_c[0])
-        nms_clas_list = []
-        nms_prebox_list = []
+        _clas_list = []
+        _prebox_list = []
         for i in range(bz):
             out_c_img = [c[i:i+1] for c in out_c]
             out_r_img = [r[i:i+1] for r in out_r]
-            nms_clas, nms_prebox = self.postprocessImg(out_c_img, out_r_img, IOU_thresh, keep_num_preNMS, keep_num_postNMS)
-            nms_clas_list.append(nms_clas)
-            nms_prebox_list.append(nms_prebox)
-        return nms_clas_list, nms_prebox_list
+            _clas, _prebox = self.postprocessImg(out_c_img, 
+                                                out_r_img, 
+                                                IOU_thresh, 
+                                                keep_num_preNMS, 
+                                                keep_num_postNMS,
+                                                keep_preNMS)
+            _clas_list.append(_clas)
+            _prebox_list.append(_prebox)
+        return _clas_list, _prebox_list
 
     # Post process the output for one image
     # Input:
@@ -370,13 +394,15 @@ class RPNHead(torch.nn.Module):
     # Output:
     #       nms_clas: (Post_NMS_boxes)
     #       nms_prebox: (Post_NMS_boxes,4)
-    def postprocessImg(self, mat_clas, mat_coord, IOU_thresh, keep_num_preNMS, keep_num_postNMS):
+    def postprocessImg(self, mat_clas, mat_coord, IOU_thresh, keep_num_preNMS, keep_num_postNMS, keep_preNMS):
         flatten_regr, flatten_clas, flatten_anchors = output_flattening(mat_coord, mat_clas, self.get_anchors())
         boxes = output_decoding(flatten_regr, flatten_anchors, device=self.device)
         sorted_clas, sorted_index = torch.sort(flatten_clas, descending=True)
         sorted_coord = torch.index_select(boxes, 0, sorted_index)
         sorted_clas = sorted_clas[:keep_num_preNMS]
         sorted_coord = sorted_coord[:keep_num_preNMS]
+        if keep_preNMS:
+            return sorted_clas, sorted_coord
         nms_clas, nms_prebox = self.NMS(sorted_clas, sorted_coord, IOU_thresh)
         nms_clas = nms_clas[:keep_num_postNMS]
         nms_prebox = nms_prebox[:keep_num_postNMS]
@@ -407,17 +433,157 @@ class RPNHead(torch.nn.Module):
         nms_clas = torch.index_select(clas, dim=0, index=indices)
         return nms_clas,nms_prebox
 
-
-if __name__ == "__main__":
+def plot_nms():
     device = "cuda:0"
-    backbone = Resnet50Backbone(device=device)
-    E = torch.ones([2,3,800,1088], device=device)
-    backout = backbone(E)
+    rpn = RPNHead(device=device)
+    # X = torch.randn(2, 3, 800, 1088)
+    # logits, bbox_regs = rpn(X)
+    # print("logits shape", logits.shape)
+    # print("bbox_reg shape", bbox_regs.shape)
+    # print(rpn.get_anchors().shape)
+    # fake_bbox = torch.tensor([[250, 320, 100, 120], [300, 400, 100, 120]])
+    # rpn.create_ground_truth(fake_bbox, 0, [50, 68], rpn.get_anchors(), [800, 1088])
+    rpn.load_state_dict(torch.load("./train_result/rpn_best_model.pth"))
+    
+    from dataset import BuildDataLoader, BuildDataset
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
 
-    model = RPNHead(device=device)
-    logits, bbox_regs = model(backout)
-    print("len(logits): ", len(logits))
-    for i in range(model.len_fpn):
-        print(f"logits[{i}].shape: ", logits[i].shape)
-        print(f"bbox_regs[{i}].shape: ", bbox_regs[i].shape)
-        print(f"anchors[{i}].shape: ", model.anchors[i].shape)
+    imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
+    masks_path = './data/hw3_mycocodata_mask_comp_zlib.h5'
+    labels_path = './data/hw3_mycocodata_labels_comp_zlib.npy'
+    bboxes_path = './data/hw3_mycocodata_bboxes_comp_zlib.npy'
+    paths = [imgs_path, masks_path, bboxes_path, labels_path]
+    dataset = BuildDataset(paths)
+    backbone = Resnet50Backbone(device=device)
+    # build the dataloader
+    # set 20% of the dataset as the training data
+    full_size = len(dataset)
+    train_size = int(full_size * 0.8)
+    test_size = full_size - train_size
+    # random split the dataset into training and testset
+
+    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    # push the randomized training data into the dataloader
+
+    # train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
+    # test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=0)
+    batch_size = 1
+    train_build_loader = BuildDataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    train_loader = train_build_loader.loader()
+    rpn.eval()
+    for i, batch in enumerate(train_loader, 0):
+        img = batch["img"].to(device)
+        logits, bbox_regs = rpn.forward_test(backbone(img))
+        # logits, bbox_regs = rpn(backbone(img))
+        logits = logits[0]
+        bbox_regs[0] = bbox_regs[0][:200]
+        logits[0] = logits[0][:200]
+        images = batch['img'][0, :, :, :]
+        indexes = batch['idx']
+        boxes = batch['bbox']
+        # gt, ground_coord = rpn.create_batch_truth(boxes, indexes, images.shape[-2:])
+
+        nms_clas_list, nms_prebox_list = rpn.postprocess(logits, bbox_regs)
+        images = transforms.functional.normalize(images,
+                                                 [-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                                                 [1 / 0.229, 1 / 0.224, 1 / 0.225], inplace=False)
+        fig, ax = plt.subplots(1, 1, figsize=(16, 8))
+        ax.imshow(images.permute(1, 2, 0))
+
+        for j in range(len(nms_clas_list[0])):
+            if nms_clas_list[0][j] > 0.5:
+                col = 'b'
+                coord = nms_prebox_list[0][j].cpu().detach().numpy()
+                rect = patches.Rectangle((coord[0] - coord[2] / 2, coord[1] - coord[3] / 2), coord[2], coord[3], fill=False,
+                                        color=col)
+                ax.add_patch(rect)
+        for j in range(len(boxes[0])):
+            col = 'r'
+            rect = patches.Rectangle((boxes[0][j, 0] - boxes[0][j, 2] / 2, boxes[0][j, 1] - boxes[0][j, 3] / 2), boxes[0][j, 2], boxes[0][j, 3],
+                                     fill=False, color=col)
+            ax.add_patch(rect)
+        ax.title.set_text("After NMS")
+
+        plt.savefig(f"./predict_vis/{i}.png")
+        plt.close()
+
+        if (i > 20):
+            break
+
+def plot_prenms():
+    device = "cuda:0"
+    rpn = RPNHead(device=device)
+    # X = torch.randn(2, 3, 800, 1088)
+    # logits, bbox_regs = rpn(X)
+    # print("logits shape", logits.shape)
+    # print("bbox_reg shape", bbox_regs.shape)
+    # print(rpn.get_anchors().shape)
+    # fake_bbox = torch.tensor([[250, 320, 100, 120], [300, 400, 100, 120]])
+    # rpn.create_ground_truth(fake_bbox, 0, [50, 68], rpn.get_anchors(), [800, 1088])
+    rpn.load_state_dict(torch.load("./train_result/rpn_best_model.pth"))
+    
+    from dataset import BuildDataLoader, BuildDataset
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
+    masks_path = './data/hw3_mycocodata_mask_comp_zlib.h5'
+    labels_path = './data/hw3_mycocodata_labels_comp_zlib.npy'
+    bboxes_path = './data/hw3_mycocodata_bboxes_comp_zlib.npy'
+    paths = [imgs_path, masks_path, bboxes_path, labels_path]
+    dataset = BuildDataset(paths)
+    backbone = Resnet50Backbone(device=device)
+    # build the dataloader
+    # set 20% of the dataset as the training data
+    full_size = len(dataset)
+    train_size = int(full_size * 0.8)
+    test_size = full_size - train_size
+    # random split the dataset into training and testset
+
+    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    # push the randomized training data into the dataloader
+
+    # train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
+    # test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=0)
+    batch_size = 1
+    train_build_loader = BuildDataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    train_loader = train_build_loader.loader()
+    rpn.eval()
+    for i, batch in enumerate(train_loader, 0):
+        img = batch["img"].to(device)
+        logits, bbox_regs = rpn.forward_test(backbone(img))
+        # logits, bbox_regs = rpn(backbone(img))
+        bbox_regs[0] = bbox_regs[0][:200]
+        logits[0] = logits[0][:200]
+        images = batch['img'][0, :, :, :]
+        indexes = batch['idx']
+        boxes = batch['bbox']
+
+        images = transforms.functional.normalize(images,
+                                                 [-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                                                 [1 / 0.229, 1 / 0.224, 1 / 0.225], inplace=False)
+        fig, ax = plt.subplots(1, 1, figsize=(16, 8))
+        ax.imshow(images.permute(1, 2, 0))
+
+        for j in range(len(logits[0])):
+            if logits[0][j] > 0.5:
+                col = 'b'
+                coord = bbox_regs[0][j].cpu().detach().numpy()
+                rect = patches.Rectangle((coord[0] - coord[2] / 2, coord[1] - coord[3] / 2), coord[2], coord[3], fill=False,
+                                        color=col)
+                ax.add_patch(rect)
+        for j in range(len(boxes[0])):
+            col = 'r'
+            rect = patches.Rectangle((boxes[0][j, 0] - boxes[0][j, 2] / 2, boxes[0][j, 1] - boxes[0][j, 3] / 2), boxes[0][j, 2], boxes[0][j, 3],
+                                     fill=False, color=col)
+            ax.add_patch(rect)
+        ax.title.set_text("After NMS")
+
+        plt.savefig(f"./predict_vis/{i}.png")
+        plt.close()
+
+        if (i > 20):
+            break
+if __name__ == "__main__":
+    plot_prenms()

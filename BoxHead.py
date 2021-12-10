@@ -5,8 +5,9 @@ from utils import *
 import torchvision
 
 class BoxHead(torch.nn.Module):
-    def __init__(self,Classes=3,P=7):
+    def __init__(self,Classes=3,P=14,device="cpu"):
         super(BoxHead, self).__init__()
+        self.device = device
         self.C=Classes
         self.P=P
         # TODO initialize BoxHead
@@ -252,7 +253,7 @@ class BoxHead(torch.nn.Module):
             for j in range(len(proposals[i])):
                 w = proposals[i][j, 2] - proposals[i][j, 0]
                 h = proposals[i][j, 3] - proposals[i][j, 1]
-                k = torch.clamp(torch.floor(4 + torch.log2(torch.sqrt(w * h)/224)).int() - 2, 0)
+                k = torch.clamp(torch.floor(4 + torch.log2(torch.sqrt(w * h)/224)).int() - 2, 0, 4)
                 feat = fpn_feat_list[k][i].unsqueeze(0)
                 scales = feat.shape[3] / self.img_size[1]
                 box = [proposals[i][j].unsqueeze(0)]

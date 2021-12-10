@@ -7,11 +7,15 @@ from torch import nn, Tensor
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 import numpy as np
+from torchvision.models.detection.image_list import ImageList
+import time
 
 from dataset import *
 from utils import *
+from BoxHead import BoxHead
 from rpn import RPNHead
 from backbone import Resnet50Backbone
+# from pretrained_models import pretrained_models_680
 
 
 imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
@@ -22,6 +26,8 @@ paths = [imgs_path, masks_path, bboxes_path, labels_path]
 epoch = 100
 batch_size = 4
 tolerance = 5
+keep_topK = 100
+torch.manual_seed(17)
 
 def main():
     dataset = BuildDataset(paths)
@@ -38,10 +44,15 @@ def main():
     print("Training Set Size", len(train_dataset), "Validation Set Size", len(test_dataset))
     print("Creating Model")
     device = "cuda:0"
-    rpn_net = RPNHead(device=device)
-    # backbone = Resnet50Backbone(device=device)
+    boxhead = BoxHead(device=device)
     print("Setting Optimizer")
-    optimizer = Adam(rpn_net.parameters(), lr=0.001, weight_decay=0.0005)
+    optimizer = Adam(boxhead.parameters(), lr=0.001)
+
+    print("Create Backbone")
+    backbone = Resnet50Backbone(device=device)
+    rpn = RPNHead(device=device)
+    rpn.load_state_dict(torch.load("./train_result/best_model.pth"))
+    # backbone, rpn = pretrained_models_680('checkpoint680.pth')
 
     best_loss = 1000.
     early_stopping = 0.
@@ -55,45 +66,56 @@ def main():
     for i in range(epoch):
         print(f"\nEpoch {i} begins")
         print("Train:")
-        loss_total, loss_c, loss_r = train(rpn_net, train_loader, optimizer, i)
+        loss_total, loss_c, loss_r = train(boxhead, backbone, rpn, train_loader, optimizer, i)
         loss_total_train += loss_total
         loss_c_train += loss_c
         loss_r_train += loss_r
         print("Validation")
-        loss_total, loss_c, loss_r = val(rpn_net, test_loader, i)
+        loss_total, loss_c, loss_r = val(boxhead, backbone, rpn, test_loader, i)
         loss_total_val += loss_total
         loss_c_val += loss_c
         loss_r_val += loss_r
         val_loss_mean = np.mean(np.array(loss_total))
         print("Epoch {} Validation Loss Mean: {:.4f}".format(i, val_loss_mean))
-        if i > 20:
-            if val_loss_mean < best_loss:
-                best_loss = val_loss_mean
-                early_stopping = 0
-                best_model = rpn_net.state_dict()
-            else:
-                early_stopping += 1
-            if early_stopping == tolerance:
-                break
-    torch.save(best_model, "./train_result/rpn_best_model.pth")
-    np.save("./train_result/rpn_total_train.npy", np.array(loss_total_train))
-    np.save("./train_result/rpn_c_train.npy", np.array(loss_c_train))
-    np.save("./train_result/rpn_r_train.npy", np.array(loss_r_train))
-    np.save("./train_result/rpn_total_val.npy", np.array(loss_total_val))
-    np.save("./train_result/rpn_c_val.npy", np.array(loss_c_val))
-    np.save("./train_result/rpn_r_val.npy", np.array(loss_r_val))
+        if val_loss_mean < best_loss:
+            best_loss = val_loss_mean
+            early_stopping = 0
+            best_model = boxhead.state_dict()
+        else:
+            early_stopping += 1
+        if early_stopping == tolerance:
+            break
+    torch.save(best_model, "./train_result/boxhead_best_model.pth")
+    np.save("./train_result/boxhead_total_train.npy", np.array(loss_total_train))
+    np.save("./train_result/boxhead_c_train.npy", np.array(loss_c_train))
+    np.save("./train_result/boxhead_r_train.npy", np.array(loss_r_train))
+    np.save("./train_result/boxhead_total_val.npy", np.array(loss_total_val))
+    np.save("./train_result/boxhead_c_val.npy", np.array(loss_c_val))
+    np.save("./train_result/boxhead_r_val.npy", np.array(loss_r_val))
 
-def train(model: RPNHead, loader, optimizer, i):
+def train(model: BoxHead, backbone, rpn:RPNHead, loader, optimizer, i):
     loss_t = []
     loss_c = []
     loss_r = []
     model.train()
     for idx, data_batch in enumerate(loader):
-        img = data_batch['img'].to(model.device)
-        logits, bbox_regs = model(img)
-        ground_clas, ground_coord = model.create_batch_truth(data_batch["bbox"], data_batch["idx"], img.shape[2:])
+        images = data_batch['img'].to(model.device)
+        bbox = data_batch["bbox"]
+        labels = data_batch["labels"]
+        bbox = [b.cuda() for b in bbox]
+        labels = [l.cuda() for l in labels]
+        backout = backbone(images)
+        # The RPN implementation takes as first argument the following image list
+        # im_lis = ImageList(images, [(800, 1088)]*images.shape[0])
+        rpnout = rpn.forward_test(backout)
+        proposals=[proposal[0:keep_topK,:] for proposal in rpnout[1]]
+        fpn_feat_list= list(backout.values())
+        feature_vectors = model.MultiScaleRoiAlign(fpn_feat_list, proposals, P=model.P)
+        gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox)
+        class_logits, box_pred = model(feature_vectors)
 
-        loss, loss1, loss2 = model.compute_loss(logits, bbox_regs, ground_clas, ground_coord)
+        loss, loss1, loss2 = model.compute_loss(class_logits, box_pred, gt_labels, regressor_target)
+        # print(b-a, c-b, d-c, e-d, f-e)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -105,16 +127,29 @@ def train(model: RPNHead, loader, optimizer, i):
                                                         loss1.item(), np.array(loss_c).mean(), loss2.item(), np.array(loss_r).mean()))
     return loss_t, loss_c, loss_r
 
-def val(model: RPNHead, loader, i):
+def val(model: BoxHead, backbone, rpn, loader, i):
     loss_t = []
     loss_c = []
     loss_r = []
     model.eval()
     for idx, data_batch in enumerate(loader):
-        img = data_batch['img'].to(model.device)
-        logits, bbox_regs = model(img)
-        ground_clas, ground_coord = model.create_batch_truth(data_batch["bbox"], data_batch["idx"], img.shape[2:])
-        loss, loss1, loss2 = model.compute_loss(logits, bbox_regs, ground_clas, ground_coord)
+        images = data_batch['img'].to(model.device)
+        bbox = data_batch["bbox"]
+        labels = data_batch["labels"]
+        bbox = [b.cuda() for b in bbox]
+        labels = [l.cuda() for l in labels]
+        backout = backbone(images)
+
+        # The RPN implementation takes as first argument the following image list
+        im_lis = ImageList(images, [(800, 1088)]*images.shape[0])
+        rpnout = rpn(im_lis, backout)
+        proposals=[proposal[0:keep_topK,:] for proposal in rpnout[0]]
+        fpn_feat_list= list(backout.values())
+        feature_vectors = model.MultiScaleRoiAlign(fpn_feat_list, proposals, P=model.P)
+        gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox)
+        class_logits, box_pred = model(feature_vectors)
+
+        loss, loss1, loss2 = model.compute_loss(class_logits, box_pred, gt_labels, regressor_target)
         loss_t.append(loss.item())
         loss_c.append(loss1.item())
         loss_r.append(loss2.item())

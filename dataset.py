@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 from utils import *
 import matplotlib.pyplot as plt
-from rpn import *
+from rpn import RPNHead
 import matplotlib.patches as patches
 
 
@@ -110,7 +110,7 @@ if __name__ == '__main__':
     # random split the dataset into training and testset
 
     train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
-    rpn_net = RPNHead(anchors_param=dict(ratio=1.2,scale=160, grid_size=(50, 68), stride=1))
+    rpn_net = RPNHead()
     # push the randomized training data into the dataloader
 
     # train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
@@ -128,7 +128,7 @@ if __name__ == '__main__':
         gt, ground_coord = rpn_net.create_batch_truth(boxes, indexes, images.shape[-2:])
 
         # Flatten the ground truth and the anchors
-        flatten_coord, flatten_gt, flatten_anchors = output_flattening(ground_coord[0], gt[0], rpn_net.get_anchors())
+        flatten_coord, flatten_gt, flatten_anchors = output_flattening(ground_coord, gt, rpn_net.get_anchors())
 
         # Decode the ground truth box to get the upper left and lower right corners of the ground truth boxes
         decoded_coord = output_decoding(flatten_coord, flatten_anchors)
