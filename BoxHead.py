@@ -38,7 +38,7 @@ class BoxHead(torch.nn.Module):
     #  Output: (make sure the ordering of the proposals are consistent with MultiScaleRoiAlign)
     #       labels: (total_proposals,1) (the class that the proposal is assigned)
     #       regressor_target: (total_proposals,4) (target encoded in the [t_x,t_y,t_w,t_h] format)
-    def create_ground_truth(self,proposals,gt_labels,bbox):
+    def create_ground_truth(self,proposals,gt_labels,bbox, iou_thresh=0.4):
         b = len(proposals)
         labels = []
         regressor_target = []
@@ -59,7 +59,7 @@ class BoxHead(torch.nn.Module):
             target_bbox[:, 2] = torch.log(bboxes[:, 2]/w_p)
             target_bbox[:, 3] = torch.log(bboxes[:, 3]/h_p)
 
-            background = (max_iou > 0.5).int()
+            background = (max_iou > iou_thresh).int()
             label = label * background
             labels.append(label)
             regressor_target.append(target_bbox)
@@ -199,7 +199,7 @@ class BoxHead(torch.nn.Module):
             bg_sample_idx = bg_labels_idx[torch.randperm(len(bg_labels_idx))[:effective_batch-max_nonbg_sample_size]]
             loss_class = class_criterion(
                 class_logits[torch.hstack([bg_sample_idx, non_bg_sample_idx])],
-                labels[torch.hstack([bg_sample_idx, non_bg_sample_idx]).squeeze(1)]
+                labels[torch.hstack([bg_sample_idx, non_bg_sample_idx])].squeeze(1)
             )
             minibatch_size = len(torch.hstack([bg_sample_idx, non_bg_sample_idx]))
             lab = labels[nonbg_labels_idx] - 1
@@ -223,7 +223,7 @@ class BoxHead(torch.nn.Module):
     #        class_logits: (total_proposals,(C+1)) (we assume classes are C classes plus background, notice if you want to use
     #                                               CrossEntropyLoss you should not pass the output through softmax here)
     #        box_pred:     (total_proposals,4*C)
-    def forward(self, feature_vectors):
+    def forward(self, feature_vectors, eval=False):
         intermediate_feature = self.intermediate(feature_vectors)
         box_pred = self.regressor(intermediate_feature)
 
@@ -264,6 +264,112 @@ class BoxHead(torch.nn.Module):
         assert feature_vectors.shape[1] == 256 * P * P
         assert len(feature_vectors.shape) == 2
         return feature_vectors.cuda()
+    
+    def preNMS(self, class_logits, box_regression, proposals, conf_thresh=0.5, keep_num_preNMS=500, keep_num_postNMS=50, IOU_thresh=0.5):
+        b = len(proposals)
+        boxes = []
+        scores = []
+        labels = []
+        start = 0
+        for i in range(b):
+            cls = class_logits[start: start + len(proposals[i])]
+            reg_box = box_regression[start: start + len(proposals[i])]
+            start += len(proposals[i])
+            
+            # Confidence cutoff
+            non_bg = torch.nonzero(cls[:, 0] < conf_thresh).squeeze(1)
+            cls = cls[non_bg]
+            reg_box = reg_box[non_bg]
+            prop = proposals[i][non_bg]
 
+            # get rid of all background predictions
+            conf, cls = torch.max(cls, dim=1)
+            nonbg_indices = torch.nonzero(cls).squeeze(1)
+            conf = torch.index_select(conf, 0, nonbg_indices)
+            cls = torch.index_select(cls, 0, nonbg_indices) - 1
+            reg_box = torch.index_select(reg_box, 0, nonbg_indices)
+            prop = torch.index_select(prop, 0, nonbg_indices)
+            
+            # decode the boxes
+            reg_cls = torch.zeros_like(prop)
+            reg_box = reg_box.reshape(-1, 3, 4)
+            for j in range(len(reg_cls)):
+                reg_cls[j] = reg_box[j, cls[j]]
+            box = output_decodingd(reg_cls, prop)  # x1 y1 x2 y2 type
+
+            # Cutoff pre NMS
+            conf = conf[:20]
+            cls = cls[:20]
+            box = box[:20]
+            boxes.append(box)
+            scores.append(conf)
+            labels.append(cls)
+        return boxes, scores, labels
+
+def plot_result():
+    from dataset import BuildDataset, BuildDataLoader
+    from rpn import RPNHead
+    from torchvision import transforms
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
+    masks_path = './data/hw3_mycocodata_mask_comp_zlib.h5'
+    labels_path = './data/hw3_mycocodata_labels_comp_zlib.npy'
+    bboxes_path = './data/hw3_mycocodata_bboxes_comp_zlib.npy'
+    paths = [imgs_path, masks_path, bboxes_path, labels_path]
+
+    dataset = BuildDataset(paths)
+    full_size = len(dataset)
+    train_size = int(full_size * 0.8)
+    test_size = full_size - train_size
+    # random split the dataset into training and testset
+    print("Data Loading")
+    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    test_build_loader = BuildDataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=4)
+    test_loader = test_build_loader.loader()
+    rcnn_net = BoxHead(device="cuda:0")
+    rpn = RPNHead(device="cuda:0")
+    rpn.load_state_dict(torch.load("./train_result/rpn_best_model.pth"))
+
+    rcnn_net.load_state_dict(torch.load("./train_result/boxhead_best_model.pth"))
+    rcnn_net.eval()
+    for idx, data_batch in enumerate(test_loader):
+        images = data_batch['img'].to(rcnn_net.device)
+        bbox = data_batch["bbox"]
+        labels = data_batch["labels"]
+        bbox = [b.cuda() for b in bbox]
+        labels = [l.cuda() for l in labels]
+        _, new_coord_list, X = rpn.forward_test(images)
+        proposals=[proposal[0:200,:] for proposal in new_coord_list]
+        fpn_feat_list= list(X.values())
+        feature_vectors = rcnn_net.MultiScaleRoiAlign(fpn_feat_list, proposals, P=rcnn_net.P)
+        class_logits, box_pred = rcnn_net(feature_vectors, eval=True)
+        boxes, scores, labels = rcnn_net.preNMS(class_logits, box_pred, proposals)
+
+        img = images[0, :, :, :].cpu()
+        img = transforms.functional.normalize(img, [-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                                                 [1 / 0.229, 1 / 0.224, 1 / 0.225], inplace=False)
+        fig, ax = plt.subplots(1, 1)
+        ax.imshow(img.permute(1, 2, 0))
+
+        boxes = boxes[0].cpu().detach().numpy()
+        col = ["y", "g", "b"]
+        for i in range(len(boxes)):
+            b = boxes[i]
+            rect = patches.Rectangle((b[0], b[1]), b[2]-b[0], b[3] - b[1], fill=False,
+                                        color=col[labels[0][i]])
+            ax.add_patch(rect)
+        
+        for b in bbox[0]:
+            b = b.cpu().detach().numpy()
+            col = "r"
+            rect = patches.Rectangle((b[0] - b[2]/2, b[1] - b[3]/2), b[2], b[3], fill=False,
+                                        color=col)
+            ax.add_patch(rect)
+
+        plt.savefig(f"./predict_vis/boxhead/preNMS/{idx}.png")
+        plt.close()
+        if idx > 20:
+            break
 if __name__ == '__main__':
-    pass
+    plot_result()

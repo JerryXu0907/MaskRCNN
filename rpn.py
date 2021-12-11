@@ -56,8 +56,8 @@ class RPNHead(torch.nn.Module):
     # Ouput:
     #       logits: list:len(FPN){(bz,1*num_anchors,grid_size[0],grid_size[1])}
     #       bbox_regs: list:len(FPN){(bz,4*num_anchors, grid_size[0],grid_size[1])}
-    def forward(self, img):
-        X = self.backbone(img)
+    def forward(self, X):
+        X = self.backbone(X)
         logits = []
         bbox_regs = []
         for i in range(self.len_fpn):
@@ -67,13 +67,14 @@ class RPNHead(torch.nn.Module):
         return logits, bbox_regs
     
     def forward_test(self, X):
+        X = self.backbone(X)
         logits = []
         bbox_regs = []
         for i in range(self.len_fpn):
             logit, reg = self.forward_single(X[self.backbone_keys[i]])
             logits.append(logit)
             bbox_regs.append(reg)
-        sorted_clas_list, sorted_coord_list = self.postprocess(logits, bbox_regs,keep_num_postNMS=200)#  ,keep_preNMS=True)
+        sorted_clas_list, sorted_coord_list = self.postprocess(logits, bbox_regs, keep_num_postNMS=200, keep_preNMS=True)
         new_coord_list = []
         for i in range(len(sorted_coord_list)):
             coords = sorted_coord_list[i]
@@ -83,7 +84,7 @@ class RPNHead(torch.nn.Module):
             xaya_coords[..., 2] = coords[..., 0] + coords[..., 2] / 2
             xaya_coords[..., 3] = coords[..., 1] + coords[..., 3] / 2
             new_coord_list.append(xaya_coords)
-        return sorted_clas_list, new_coord_list
+        return sorted_clas_list, new_coord_list, X
 
     # Forward a single level of the FPN output through the intermediate layer and the RPN heads
     # Input:
@@ -298,66 +299,24 @@ class RPNHead(torch.nn.Module):
     #       loss_c: scalar
     #       loss_r: scalar
     def compute_loss(self, clas_out_list, regr_out_list, targ_clas_list, targ_regr_list, l=1, effective_batch=50):
-        total_loss, total_loss_c, total_loss_r = 0., 0., 0.
-        for n in range(self.len_fpn):
-            clas_out = clas_out_list[n]
-            regr_out = regr_out_list[n]
-            targ_clas = targ_clas_list[n]
-            targ_regr = targ_regr_list[n]
-            N_reg = clas_out.shape[-1] * clas_out.shape[-2]
-            clas_out = clas_out.permute(0, 2, 3, 1).reshape(-1, 1)
-            regr_out = regr_out.permute(0, 2, 3, 1).reshape(-1, 4*3).reshape(-1, 4)
-            targ_clas = targ_clas.permute(0, 2, 3, 1).reshape(-1, 1)
-            targ_regr = targ_regr.permute(0, 2, 3, 1).reshape(-1, 4*3).reshape(-1, 4)
+        flat_clas_out = torch.clamp(torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 1) for i in clas_out_list], dim=0), 0, 1)
+        flat_regr_out = torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 4) for i in regr_out_list], dim=0)
+        flat_clas_targ = torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 1) for i in targ_clas_list], dim=0)
+        flat_regr_targ = torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 4) for i in targ_regr_list], dim=0)
+        pos_targ = torch.nonzero(flat_clas_targ == 1)[:, 0]
+        neg_targ = torch.nonzero(flat_clas_targ == -1)[:, 0]
 
-            pos_targ = torch.nonzero(targ_clas == 1)[:, 0]  # pos targ index, 1d
-            neg_targ = torch.nonzero(targ_clas == -1)[:, 0]  # neg targ index, 1d
-            if self.training:
-                if pos_targ.shape[0] + neg_targ.shape[0] < effective_batch:
-                    # no enough samples
-                    mbatch_targ_regr = targ_regr[pos_targ]
-                    mbatch_regr_out = regr_out[pos_targ]
-                    mbatch_clas_out_pos = clas_out[pos_targ]
-                    mbatch_clas_out_neg = clas_out[neg_targ]
-
-                elif pos_targ.shape[0] < effective_batch // 2:
-                    # no enough pos samples
-                    neg_targ_sampleidx = np.random.choice(a=neg_targ.shape[0], size=effective_batch - pos_targ.shape[0],
-                                                        replace=False)
-                    mbatch_targ_regr = targ_regr[pos_targ]
-                    mbatch_regr_out = regr_out[pos_targ]
-                    mbatch_clas_out_pos = clas_out[pos_targ]
-                    mbatch_clas_out_neg = clas_out[neg_targ[neg_targ_sampleidx]]
-
-                elif neg_targ.shape[0] < effective_batch // 2:
-                    # no enough pos samples
-                    pos_targ_sampleidx = np.random.choice(a=pos_targ.shape[0], size=effective_batch - neg_targ.shape[0],
-                                                        replace=False)
-                    mbatch_targ_regr = targ_regr[pos_targ]
-                    mbatch_regr_out = regr_out[pos_targ]
-                    mbatch_clas_out_pos = clas_out[pos_targ[pos_targ_sampleidx]]
-                    mbatch_clas_out_neg = clas_out[neg_targ]
-                    
-                else:
-                    pos_sample = effective_batch // 2
-                    neg_sample = effective_batch - pos_sample
-                    pos_targ_sampleidx = np.random.choice(a=pos_targ.shape[0], size=pos_sample, replace=False)
-                    neg_targ_sampleidx = np.random.choice(a=neg_targ.shape[0], size=neg_sample, replace=False)
-                    mbatch_targ_regr = targ_regr[pos_targ[pos_targ_sampleidx]]
-                    mbatch_regr_out = regr_out[pos_targ[pos_targ_sampleidx]]
-                    mbatch_clas_out_pos = clas_out[pos_targ[pos_targ_sampleidx]]
-                    mbatch_clas_out_neg = clas_out[neg_targ[neg_targ_sampleidx]]
-
-                loss_c, sum_count_c = self.loss_class(mbatch_clas_out_pos, mbatch_clas_out_neg)
-                loss_r, sum_count_r = self.loss_reg(mbatch_targ_regr, mbatch_regr_out)
-            else:
-                loss_c, sum_count_c = self.loss_class(clas_out[pos_targ], clas_out[neg_targ])
-                loss_r, sum_count_r = self.loss_reg(targ_regr[pos_targ], regr_out[pos_targ])
-            loss = loss_c / sum_count_c + l * loss_r / N_reg
-            total_loss += loss
-            total_loss_c += loss_c
-            total_loss_r += loss_r
-        return total_loss, total_loss_c, total_loss_r
+        sample_len = int(min(len(pos_targ), effective_batch/2))
+        pos_targ_sampleidx = np.random.choice(a=len(pos_targ), size=sample_len, replace=False)
+        neg_targ_sampleidx = np.random.choice(a=len(neg_targ), size=effective_batch - sample_len, replace=False)
+        mbatch_clas_pos = flat_clas_out[pos_targ[pos_targ_sampleidx]]
+        mbatch_clas_neg = flat_clas_out[neg_targ[neg_targ_sampleidx]]
+        mbatch_regr_out = flat_regr_out[pos_targ[pos_targ_sampleidx]]
+        mbatch_regr_targ = flat_regr_targ[pos_targ[pos_targ_sampleidx]]
+        loss_c, sum_count_c = self.loss_class(mbatch_clas_pos, mbatch_clas_neg)
+        loss_r, sum_count_r = self.loss_reg(mbatch_regr_targ, mbatch_regr_out)
+        loss = loss_c/sum_count_c + loss_r * l / sum_count_c
+        return loss, loss_c/sum_count_c, loss_r * l / sum_count_c
 
 
     # Post process for the outputs for a batch of images
@@ -398,9 +357,12 @@ class RPNHead(torch.nn.Module):
         flatten_regr, flatten_clas, flatten_anchors = output_flattening(mat_coord, mat_clas, self.get_anchors())
         boxes = output_decoding(flatten_regr, flatten_anchors, device=self.device)
         sorted_clas, sorted_index = torch.sort(flatten_clas, descending=True)
-        sorted_coord = torch.index_select(boxes, 0, sorted_index)
+        sorted_coord = boxes[sorted_index]
         sorted_clas = sorted_clas[:keep_num_preNMS]
         sorted_coord = sorted_coord[:keep_num_preNMS]
+        ind = torch.nonzero(sorted_clas > 0.6)[:, 0]
+        sorted_clas = sorted_clas[ind]
+        sorted_coord = sorted_coord[ind]
         if keep_preNMS:
             return sorted_clas, sorted_coord
         nms_clas, nms_prebox = self.NMS(sorted_clas, sorted_coord, IOU_thresh)

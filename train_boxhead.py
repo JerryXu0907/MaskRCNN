@@ -5,7 +5,7 @@ import torchvision
 from torchvision import transforms
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import Adam, SGD
 import numpy as np
 from torchvision.models.detection.image_list import ImageList
 import time
@@ -26,7 +26,7 @@ paths = [imgs_path, masks_path, bboxes_path, labels_path]
 epoch = 100
 batch_size = 4
 tolerance = 5
-keep_topK = 100
+keep_topK = 300
 torch.manual_seed(17)
 
 def main():
@@ -46,12 +46,12 @@ def main():
     device = "cuda:0"
     boxhead = BoxHead(device=device)
     print("Setting Optimizer")
-    optimizer = Adam(boxhead.parameters(), lr=0.001)
+    optimizer = SGD(boxhead.parameters(), lr=0.0001, momentum=0.9, weight_decay=0.0005)
 
     print("Create Backbone")
-    backbone = Resnet50Backbone(device=device)
     rpn = RPNHead(device=device)
-    rpn.load_state_dict(torch.load("./train_result/best_model.pth"))
+    rpn.load_state_dict(torch.load("./train_result/rpn_best_model.pth"))
+    rpn.eval()
     # backbone, rpn = pretrained_models_680('checkpoint680.pth')
 
     best_loss = 1000.
@@ -66,12 +66,12 @@ def main():
     for i in range(epoch):
         print(f"\nEpoch {i} begins")
         print("Train:")
-        loss_total, loss_c, loss_r = train(boxhead, backbone, rpn, train_loader, optimizer, i)
+        loss_total, loss_c, loss_r = train(boxhead, rpn, train_loader, optimizer, i)
         loss_total_train += loss_total
         loss_c_train += loss_c
         loss_r_train += loss_r
         print("Validation")
-        loss_total, loss_c, loss_r = val(boxhead, backbone, rpn, test_loader, i)
+        loss_total, loss_c, loss_r = val(boxhead, rpn, test_loader, i)
         loss_total_val += loss_total
         loss_c_val += loss_c
         loss_r_val += loss_r
@@ -93,7 +93,7 @@ def main():
     np.save("./train_result/boxhead_c_val.npy", np.array(loss_c_val))
     np.save("./train_result/boxhead_r_val.npy", np.array(loss_r_val))
 
-def train(model: BoxHead, backbone, rpn:RPNHead, loader, optimizer, i):
+def train(model: BoxHead, rpn:RPNHead, loader, optimizer, i):
     loss_t = []
     loss_c = []
     loss_r = []
@@ -104,18 +104,14 @@ def train(model: BoxHead, backbone, rpn:RPNHead, loader, optimizer, i):
         labels = data_batch["labels"]
         bbox = [b.cuda() for b in bbox]
         labels = [l.cuda() for l in labels]
-        backout = backbone(images)
-        # The RPN implementation takes as first argument the following image list
-        # im_lis = ImageList(images, [(800, 1088)]*images.shape[0])
-        rpnout = rpn.forward_test(backout)
-        proposals=[proposal[0:keep_topK,:] for proposal in rpnout[1]]
-        fpn_feat_list= list(backout.values())
+        _, new_coord_list, X = rpn.forward_test(images)
+        proposals=[proposal[0:keep_topK,:].detach() for proposal in new_coord_list]
+        # plot(proposals, data_batch)
+        fpn_feat_list= [t.detach() for t in list(X.values())]
         feature_vectors = model.MultiScaleRoiAlign(fpn_feat_list, proposals, P=model.P)
-        gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox)
+        gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox, iou_thresh=0.5)
         class_logits, box_pred = model(feature_vectors)
-
         loss, loss1, loss2 = model.compute_loss(class_logits, box_pred, gt_labels, regressor_target)
-        # print(b-a, c-b, d-c, e-d, f-e)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -127,7 +123,7 @@ def train(model: BoxHead, backbone, rpn:RPNHead, loader, optimizer, i):
                                                         loss1.item(), np.array(loss_c).mean(), loss2.item(), np.array(loss_r).mean()))
     return loss_t, loss_c, loss_r
 
-def val(model: BoxHead, backbone, rpn, loader, i):
+def val(model: BoxHead, rpn, loader, i):
     loss_t = []
     loss_c = []
     loss_r = []
@@ -138,13 +134,9 @@ def val(model: BoxHead, backbone, rpn, loader, i):
         labels = data_batch["labels"]
         bbox = [b.cuda() for b in bbox]
         labels = [l.cuda() for l in labels]
-        backout = backbone(images)
-
-        # The RPN implementation takes as first argument the following image list
-        im_lis = ImageList(images, [(800, 1088)]*images.shape[0])
-        rpnout = rpn(im_lis, backout)
-        proposals=[proposal[0:keep_topK,:] for proposal in rpnout[0]]
-        fpn_feat_list= list(backout.values())
+        _, new_coord_list, X = rpn.forward_test(images)
+        proposals=[proposal[0:keep_topK,:] for proposal in new_coord_list]
+        fpn_feat_list= list(X.values())
         feature_vectors = model.MultiScaleRoiAlign(fpn_feat_list, proposals, P=model.P)
         gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox)
         class_logits, box_pred = model(feature_vectors)
@@ -157,6 +149,34 @@ def val(model: BoxHead, backbone, rpn, loader, i):
             print("Valid Epoch {} Batch {}: Total Loss {:.3f} ({:.3f}); Class Loss {:.3f} ({:.3f}); Regressor Loss {:.3f} ({:.3f})".format(i, idx, loss.item(), np.array(loss_t).mean(), 
                                                         loss1.item(), np.array(loss_c).mean(), loss2.item(), np.array(loss_r).mean()))
     return loss_t, loss_c, loss_r
+
+
+def plot(proposals, data_batch, batch_size=4):
+    images = data_batch['img']
+    boxes = data_batch['bbox']
+    _, ax = plt.subplots(2, 2, figsize=(16, 8))
+
+    for i in range(4):
+        img = images[i]
+        img = transforms.functional.normalize(img,
+                                            [-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                                            [1 / 0.229, 1 / 0.224, 1 / 0.225], inplace=False)
+        
+        ax[i//2, i%2].imshow(img.permute(1, 2, 0))
+
+        for j in range(len(proposals[i])):
+            col = 'b'
+            coord = proposals[i][j].cpu().detach().numpy()
+            rect = patches.Rectangle((coord[0], coord[1]), coord[2]-coord[0], coord[3]-coord[1], fill=False,
+                                    color=col)
+            ax[i//2, i%2].add_patch(rect)
+        for j in range(len(boxes[i])):
+            col = 'r'
+            rect = patches.Rectangle((boxes[i][j, 0] - boxes[i][j, 2] / 2, boxes[i][j, 1] - boxes[i][j, 3] / 2), boxes[i][j, 2], boxes[i][j, 3],
+                                        fill=False, color=col)
+            ax[i//2, i%2].add_patch(rect)
+        ax[i//2, i%2].title.set_text(f"{i+1}-th img")
+    plt.show()
 
 if __name__ == "__main__":
     main()
