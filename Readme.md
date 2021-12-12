@@ -2,7 +2,7 @@
 
 Run the **Dataset** block in final.ipynb to demonstrate the mask and bound-box of the ground truth. 
 
-![image-20211211180120379](.\result\gt_dataset)
+<img src=".\result\gt_dataset" alt="image-20211211180120379"  />
 
 
 
@@ -28,4 +28,4 @@ Run the **Train** block in final.ipynb to train the maskhead.
 
 Run the **test** block in evalutation_maskhead to check the training result.
 
-![image-20211211180459195](.\result\result)
+<img src=".\result\result" alt="image-20211211180459195"  />
