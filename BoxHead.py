@@ -80,7 +80,14 @@ class BoxHead(torch.nn.Module):
     #       boxes: list:len(bz){(post_NMS_boxes_per_image,4)}  ([x1,y1,x2,y2] format)
     #       scores: list:len(bz){(post_NMS_boxes_per_image)}   ( the score for the top class for the regressed box)
     #       labels: list:len(bz){(post_NMS_boxes_per_image)}   (top class of each regressed box)
-    def postprocess_detections(self, class_logits, box_regression, proposals, conf_thresh=0.5, keep_num_preNMS=500, keep_num_postNMS=50):
+    def postprocess_detections(self, class_logits, 
+                               box_regression, 
+                               proposals, 
+                               gt_boxes=None,
+                               conf_thresh=0.5, 
+                               keep_num_preNMS=500, 
+                               keep_num_postNMS=100,
+                               train=False):
         b = len(proposals)
         boxes = []
         scores = []
@@ -159,58 +166,31 @@ class BoxHead(torch.nn.Module):
     #      loss: scalar
     #      loss_class: scalar
     #      loss_regr: scalar
-    def compute_loss(self,class_logits, box_preds, labels, regression_targets,l=10,effective_batch=150):
+    def compute_loss(self,class_logits, box_preds, labels, regression_targets,l=1,effective_batch=150):
         class_criterion = nn.CrossEntropyLoss(reduction='sum')
         regr_criterion = nn.SmoothL1Loss(reduction='sum')
 
         bg_labels_idx = torch.nonzero(labels==0)[:, 0]
         nonbg_labels_idx = torch.nonzero(labels!=0)[:, 0]
         max_nonbg_sample_size = int(0.75*effective_batch)
+        nonbg_sample_size = min(len(nonbg_labels_idx), max_nonbg_sample_size)
+        bg_sample_size = effective_batch - nonbg_sample_size
 
-        if  max_nonbg_sample_size > len(nonbg_labels_idx):
-            # assume nonbg_grids < bg_grids
-            if len(bg_labels_idx) > 3*len(nonbg_labels_idx):
-                bg_sample_idx = bg_labels_idx[torch.randperm(len(bg_labels_idx))[:3*len(nonbg_labels_idx)]]
-                loss_class = class_criterion(
-                    class_logits[torch.hstack([bg_sample_idx, nonbg_labels_idx])],
-                    labels[torch.hstack([bg_sample_idx, nonbg_labels_idx])].squeeze(1))
-                minibatch_size = len(torch.hstack([bg_sample_idx, nonbg_labels_idx]))
+        bg_sample_idx = bg_labels_idx[torch.randperm(len(bg_labels_idx))[:bg_sample_size]]
+        nonbg_sample_idx = nonbg_labels_idx[torch.randperm(len(nonbg_labels_idx))[:nonbg_sample_size]]
+        loss_class = class_criterion(
+                    class_logits[torch.hstack([bg_sample_idx, nonbg_sample_idx])],
+                    labels[torch.hstack([bg_sample_idx, nonbg_sample_idx])].squeeze(1))
+        
+        lab = labels[nonbg_sample_idx] - 1
+        preds = torch.zeros_like(regression_targets[nonbg_sample_idx])
+        t_preds = box_preds[nonbg_sample_idx].reshape(-1, 3, 4)
+        for i in range(len(preds)):
+            preds[i] = t_preds[i][lab[i]]
+        loss_regr = regr_criterion(preds, regression_targets[nonbg_sample_idx])
 
-                lab = labels[nonbg_labels_idx] - 1
-                preds = torch.zeros_like(regression_targets[nonbg_labels_idx])
-                t_preds = box_preds[nonbg_labels_idx].reshape(-1, 3, 4)
-                for i in range(len(preds)):
-                    preds[i] = t_preds[i][lab[i]]
-                loss_regr = regr_criterion(preds, regression_targets[nonbg_labels_idx])
-            else:
-                non_bg_sample_idx = nonbg_labels_idx[torch.randperm(len(nonbg_labels_idx))[:max(int(len(nonbg_labels_idx)/3)-1, 1)]]
-                loss_class = class_criterion(
-                    class_logits[torch.hstack([bg_labels_idx, non_bg_sample_idx])],
-                    labels[torch.hstack([bg_labels_idx, non_bg_sample_idx])].squeeze(1))
-                minibatch_size = len(torch.hstack([bg_labels_idx, non_bg_sample_idx]))
-                lab = labels[nonbg_labels_idx] - 1
-                preds = torch.zeros_like(regression_targets[nonbg_labels_idx])
-                t_preds = box_preds[nonbg_labels_idx].reshape(-1, 3, 4)
-                for i in range(len(preds)):
-                    preds[i] = t_preds[i][lab[i]]
-                loss_regr = regr_criterion(preds, regression_targets[nonbg_labels_idx])
-        else:
-            non_bg_sample_idx = nonbg_labels_idx[torch.randperm(len(nonbg_labels_idx))[:max_nonbg_sample_size]]
-            bg_sample_idx = bg_labels_idx[torch.randperm(len(bg_labels_idx))[:effective_batch-max_nonbg_sample_size]]
-            loss_class = class_criterion(
-                class_logits[torch.hstack([bg_sample_idx, non_bg_sample_idx])],
-                labels[torch.hstack([bg_sample_idx, non_bg_sample_idx])].squeeze(1)
-            )
-            minibatch_size = len(torch.hstack([bg_sample_idx, non_bg_sample_idx]))
-            lab = labels[nonbg_labels_idx] - 1
-            preds = torch.zeros_like(regression_targets[nonbg_labels_idx])
-            t_preds = box_preds[nonbg_labels_idx].reshape(-1, 3, 4)
-            for i in range(len(preds)):
-                preds[i] = t_preds[i][lab[i]]
-            loss_regr = regr_criterion(preds, regression_targets[nonbg_labels_idx])
-
-        loss_class = loss_class / minibatch_size
-        loss_regr = loss_regr / minibatch_size
+        loss_class = loss_class / effective_batch
+        loss_regr = loss_regr / effective_batch
         loss = loss_class + l*loss_regr
 
         return loss, loss_class, loss_regr

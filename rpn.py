@@ -48,6 +48,7 @@ class RPNHead(torch.nn.Module):
         self.anchors = self.create_anchors(self.anchors_param['ratio'],self.anchors_param['scale'],self.anchors_param['grid_size'],self.anchors_param['stride'])
         self.ground_dict = {}
         self.backbone_keys = ['0', '1', '2', '3', 'pool']
+        self.image_size = [800, 1066]
         
 
     # Forward each level of the FPN output through the intermediate layer and the RPN heads
@@ -74,7 +75,7 @@ class RPNHead(torch.nn.Module):
             logit, reg = self.forward_single(X[self.backbone_keys[i]])
             logits.append(logit)
             bbox_regs.append(reg)
-        sorted_clas_list, sorted_coord_list = self.postprocess(logits, bbox_regs, keep_num_postNMS=200, keep_preNMS=True)
+        sorted_clas_list, sorted_coord_list = self.postprocess(logits, bbox_regs, keep_num_postNMS=400)#, keep_preNMS=True)
         new_coord_list = []
         for i in range(len(sorted_coord_list)):
             coords = sorted_coord_list[i]
@@ -298,7 +299,8 @@ class RPNHead(torch.nn.Module):
     #       loss: scalar
     #       loss_c: scalar
     #       loss_r: scalar
-    def compute_loss(self, clas_out_list, regr_out_list, targ_clas_list, targ_regr_list, l=1, effective_batch=50):
+    def compute_loss(self, clas_out_list, regr_out_list, targ_clas_list, targ_regr_list, l=1, effective_batch=50, eval=False):
+        total_loss, total_loss_c, total_loss_r = 0., 0., 0.
         flat_clas_out = torch.clamp(torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 1) for i in clas_out_list], dim=0), 0, 1)
         flat_regr_out = torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 4) for i in regr_out_list], dim=0)
         flat_clas_targ = torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 1) for i in targ_clas_list], dim=0)
@@ -306,17 +308,25 @@ class RPNHead(torch.nn.Module):
         pos_targ = torch.nonzero(flat_clas_targ == 1)[:, 0]
         neg_targ = torch.nonzero(flat_clas_targ == -1)[:, 0]
 
-        sample_len = int(min(len(pos_targ), effective_batch/2))
-        pos_targ_sampleidx = np.random.choice(a=len(pos_targ), size=sample_len, replace=False)
-        neg_targ_sampleidx = np.random.choice(a=len(neg_targ), size=effective_batch - sample_len, replace=False)
-        mbatch_clas_pos = flat_clas_out[pos_targ[pos_targ_sampleidx]]
-        mbatch_clas_neg = flat_clas_out[neg_targ[neg_targ_sampleidx]]
-        mbatch_regr_out = flat_regr_out[pos_targ[pos_targ_sampleidx]]
-        mbatch_regr_targ = flat_regr_targ[pos_targ[pos_targ_sampleidx]]
-        loss_c, sum_count_c = self.loss_class(mbatch_clas_pos, mbatch_clas_neg)
-        loss_r, sum_count_r = self.loss_reg(mbatch_regr_targ, mbatch_regr_out)
-        loss = loss_c/sum_count_c + loss_r * l / sum_count_c
-        return loss, loss_c/sum_count_c, loss_r * l / sum_count_c
+        if not eval:
+            sample_len = int(min(len(pos_targ), effective_batch/2))
+            pos_targ_sampleidx = np.random.choice(a=len(pos_targ), size=sample_len, replace=False)
+            neg_targ_sampleidx = np.random.choice(a=len(neg_targ), size=effective_batch - sample_len, replace=False)
+            mbatch_clas_pos = flat_clas_out[pos_targ[pos_targ_sampleidx]]
+            mbatch_clas_neg = flat_clas_out[neg_targ[neg_targ_sampleidx]]
+            mbatch_regr_out = flat_regr_out[pos_targ[pos_targ_sampleidx]]
+            mbatch_regr_targ = flat_regr_targ[pos_targ[pos_targ_sampleidx]]
+            loss_c, sum_count_c = self.loss_class(mbatch_clas_pos, mbatch_clas_neg)
+            loss_r, sum_count_r = self.loss_reg(mbatch_regr_targ, mbatch_regr_out)
+            loss = loss_c/sum_count_c + loss_r * l / sum_count_r
+        else:
+            loss_c, sum_count_c = self.loss_class(flat_clas_out[pos_targ], flat_clas_out[neg_targ])
+            loss_r, sum_count_r = self.loss_reg(flat_regr_targ[pos_targ], flat_regr_out[pos_targ])
+            loss = loss_c/sum_count_c + loss_r * l / sum_count_r
+        total_loss += loss
+        total_loss_c += loss_c/sum_count_c
+        total_loss_r += loss_r * l / sum_count_r
+        return total_loss, total_loss_c, total_loss_r
 
 
     # Post process for the outputs for a batch of images
@@ -329,7 +339,7 @@ class RPNHead(torch.nn.Module):
     # Output:
     #       nms_clas_list: list:len(bz){(Post_NMS_boxes)} (the score of the boxes that the NMS kept)
     #       nms_prebox_list: list:len(bz){(Post_NMS_boxes,4)} (the coordinate of the boxes that the NMS kept)
-    def postprocess(self, out_c, out_r, IOU_thresh=0.5, keep_num_preNMS=500, keep_num_postNMS=200, keep_preNMS=False):
+    def postprocess(self, out_c, out_r, IOU_thresh=0.5, keep_num_preNMS=3000, keep_num_postNMS=1000, train=True):
         bz = len(out_c[0])
         _clas_list = []
         _prebox_list = []
@@ -341,7 +351,7 @@ class RPNHead(torch.nn.Module):
                                                 IOU_thresh, 
                                                 keep_num_preNMS, 
                                                 keep_num_postNMS,
-                                                keep_preNMS)
+                                                train)
             _clas_list.append(_clas)
             _prebox_list.append(_prebox)
         return _clas_list, _prebox_list
@@ -353,9 +363,19 @@ class RPNHead(torch.nn.Module):
     # Output:
     #       nms_clas: (Post_NMS_boxes)
     #       nms_prebox: (Post_NMS_boxes,4)
-    def postprocessImg(self, mat_clas, mat_coord, IOU_thresh, keep_num_preNMS, keep_num_postNMS, keep_preNMS):
+    def postprocessImg(self, mat_clas, mat_coord, IOU_thresh, keep_num_preNMS, keep_num_postNMS, train):
         flatten_regr, flatten_clas, flatten_anchors = output_flattening(mat_coord, mat_clas, self.get_anchors())
-        boxes = output_decoding(flatten_regr, flatten_anchors, device=self.device)
+        boxes = output_decoding(flatten_regr, flatten_anchors, device=self.device) # xyxy coding
+        if train:
+            x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+            inside_idx = torch.where((x1 >= 0) & (y1 >= 0) & (x2 < self.image_size[1]) & (y2 < self.image_size[0]))
+            flatten_clas = flatten_clas[inside_idx]
+            boxes = boxes[inside_idx]
+        else:
+            boxes[:, 0] = torch.clamp_min(boxes[:, 0], 0)
+            boxes[:, 1] = torch.clamp_min(boxes[:, 1], 0)
+            boxes[:, 2] = torch.clamp_max(boxes[:, 2], self.image_size[1])
+            boxes[:, 3] = torch.clamp_max(boxes[:, 3], self.image_size[0])
         sorted_clas, sorted_index = torch.sort(flatten_clas, descending=True)
         sorted_coord = boxes[sorted_index]
         sorted_clas = sorted_clas[:keep_num_preNMS]
@@ -363,8 +383,6 @@ class RPNHead(torch.nn.Module):
         ind = torch.nonzero(sorted_clas > 0.6)[:, 0]
         sorted_clas = sorted_clas[ind]
         sorted_coord = sorted_coord[ind]
-        if keep_preNMS:
-            return sorted_clas, sorted_coord
         nms_clas, nms_prebox = self.NMS(sorted_clas, sorted_coord, IOU_thresh)
         nms_clas = nms_clas[:keep_num_postNMS]
         nms_prebox = nms_prebox[:keep_num_postNMS]
@@ -376,24 +394,9 @@ class RPNHead(torch.nn.Module):
     # Output:
     #       nms_clas: (Post_NMS_boxes)
     #       nms_prebox: (Post_NMS_boxes,4)
-    def NMS(self, clas, prebox, thresh):
-        l = list(range(len(prebox)))
-        indices = []
-        while len(l) > 0:
-            box = prebox[l[0]]
-            indices.append(l[0])
-            l.remove(l[0])
-            remove_list = []
-            for j in l:
-                iou = single_IOU(box, prebox[j])
-                if iou > thresh:
-                    remove_list.append(j)
-            for k in remove_list:
-                l.remove(k)
-        indices = torch.tensor(indices).to(self.device)
-        nms_prebox = torch.index_select(prebox, dim=0, index=indices)
-        nms_clas = torch.index_select(clas, dim=0, index=indices)
-        return nms_clas,nms_prebox
+    def NMS(self, clas, coords, thresh):
+        nms_indices = torchvision.ops.batched_nms(coords, clas, torch.zeros_like(clas), thresh)
+        return clas[nms_indices], coords[nms_indices]
 
 def plot_nms():
     device = "cuda:0"

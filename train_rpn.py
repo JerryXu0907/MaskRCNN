@@ -68,7 +68,7 @@ def main():
         val_loss_mean = np.mean(np.array(loss_total))
         print("Epoch {} Validation Loss Mean: {:.4f}".format(i, val_loss_mean))
         if i % 5 == 0:
-            torch.save(rpn_net.state_dict(), f"./train_result/rpn_model_{i}.pth")
+            torch.save(rpn_net.state_dict(), f"./train_result/rpn/rpn_model_{i}.pth")
         if i > 5:
             if val_loss_mean < best_loss:
                 best_loss = val_loss_mean
@@ -78,13 +78,13 @@ def main():
                 early_stopping += 1
             if early_stopping == tolerance:
                 break
-    torch.save(best_model, "./train_result/rpn_best_model.pth")
-    np.save("./train_result/rpn_total_train.npy", np.array(loss_total_train))
-    np.save("./train_result/rpn_c_train.npy", np.array(loss_c_train))
-    np.save("./train_result/rpn_r_train.npy", np.array(loss_r_train))
-    np.save("./train_result/rpn_total_val.npy", np.array(loss_total_val))
-    np.save("./train_result/rpn_c_val.npy", np.array(loss_c_val))
-    np.save("./train_result/rpn_r_val.npy", np.array(loss_r_val))
+    torch.save(best_model, "./train_result/rpn/rpn_best_model.pth")
+    np.save("./train_result/rpn/rpn_total_train.npy", np.array(loss_total_train))
+    np.save("./train_result/rpn/rpn_c_train.npy", np.array(loss_c_train))
+    np.save("./train_result/rpn/rpn_r_train.npy", np.array(loss_r_train))
+    np.save("./train_result/rpn/rpn_total_val.npy", np.array(loss_total_val))
+    np.save("./train_result/rpn/rpn_c_val.npy", np.array(loss_c_val))
+    np.save("./train_result/rpn/rpn_r_val.npy", np.array(loss_r_val))
 
 def train(model: RPNHead, backbone, loader, optimizer, i):
     loss_t = []
@@ -124,7 +124,7 @@ def val(model: RPNHead, backbone, loader, i, draw=True):
         else:
             logits, bbox_regs = model(backbone(img))
         ground_clas, ground_coord = model.create_batch_truth(data_batch["bbox"], data_batch["idx"], img.shape[2:])
-        loss, loss1, loss2 = model.compute_loss(logits, bbox_regs, ground_clas, ground_coord)
+        loss, loss1, loss2 = model.compute_loss(logits, bbox_regs, ground_clas, ground_coord, eval=True)
         if draw and idx % 50 == 0:
             plot_NMS(model, data_batch, logits, bbox_regs, i, idx)
         loss_t.append(loss.item())
@@ -137,8 +137,8 @@ def val(model: RPNHead, backbone, loader, i, draw=True):
 
 def plot_NMS(model:RPNHead, data_batch, logits, bbox_regs, epoch, idx):
     logits, bbox_regs = model.postprocess(logits, bbox_regs)
-    bbox_regs[0] = bbox_regs[0][:200]
-    logits[0] = logits[0][:200]
+    bbox_regs[0] = bbox_regs[0][:20]
+    logits[0] = logits[0][:20]
     images = data_batch['img'][0, :, :, :]
     boxes = data_batch['bbox']
     images = transforms.functional.normalize(images,
@@ -160,7 +160,7 @@ def plot_NMS(model:RPNHead, data_batch, logits, bbox_regs, epoch, idx):
                                     fill=False, color=col)
         ax.add_patch(rect)
     ax.title.set_text("After NMS")
-    plt.savefig(f"./predict_vis/{epoch}_{idx}.png")
+    plt.savefig(f"./predict_vis/rpnhead/{epoch}_{idx}.png")
     plt.close()
 
 if __name__ == "__main__":

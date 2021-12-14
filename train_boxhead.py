@@ -26,7 +26,7 @@ paths = [imgs_path, masks_path, bboxes_path, labels_path]
 epoch = 100
 batch_size = 4
 tolerance = 5
-keep_topK = 300
+keep_topK = 1000
 torch.manual_seed(17)
 
 def main():
@@ -50,7 +50,7 @@ def main():
 
     print("Create Backbone")
     rpn = RPNHead(device=device)
-    rpn.load_state_dict(torch.load("./train_result/rpn_best_model.pth"))
+    rpn.load_state_dict(torch.load("./train_result/rpn/rpn_best_model.pth"))
     rpn.eval()
     # backbone, rpn = pretrained_models_680('checkpoint680.pth')
 
@@ -85,13 +85,13 @@ def main():
             early_stopping += 1
         if early_stopping == tolerance:
             break
-    torch.save(best_model, "./train_result/boxhead_best_model.pth")
-    np.save("./train_result/boxhead_total_train.npy", np.array(loss_total_train))
-    np.save("./train_result/boxhead_c_train.npy", np.array(loss_c_train))
-    np.save("./train_result/boxhead_r_train.npy", np.array(loss_r_train))
-    np.save("./train_result/boxhead_total_val.npy", np.array(loss_total_val))
-    np.save("./train_result/boxhead_c_val.npy", np.array(loss_c_val))
-    np.save("./train_result/boxhead_r_val.npy", np.array(loss_r_val))
+    torch.save(best_model, "./train_result/boxhead_rpn_nms/boxhead_best_model.pth")
+    np.save("./train_result/boxhead_rpn_nms/boxhead_total_train.npy", np.array(loss_total_train))
+    np.save("./train_result/boxhead_rpn_nms/boxhead_c_train.npy", np.array(loss_c_train))
+    np.save("./train_result/boxhead_rpn_nms/boxhead_r_train.npy", np.array(loss_r_train))
+    np.save("./train_result/boxhead_rpn_nms/boxhead_total_val.npy", np.array(loss_total_val))
+    np.save("./train_result/boxhead_rpn_nms/boxhead_c_val.npy", np.array(loss_c_val))
+    np.save("./train_result/boxhead_rpn_nms/boxhead_r_val.npy", np.array(loss_r_val))
 
 def train(model: BoxHead, rpn:RPNHead, loader, optimizer, i):
     loss_t = []

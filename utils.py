@@ -142,7 +142,11 @@ def output_decoding(flatten_out,flatten_anchors, device='cpu'):
     y = flatten_out[:, 1] * flatten_anchors[:, 3] + flatten_anchors[:, 1]
     w = flatten_anchors[:, 2] * torch.exp(flatten_out[:, 2])
     h = flatten_anchors[:, 3] * torch.exp(flatten_out[:, 3])
-    box = torch.stack([x, y, w, h], dim=1)
+    x1 = x - w / 2
+    x2 = x + w / 2
+    y1 = y - h / 2
+    y2 = y + h / 2
+    box = torch.stack([x1, y1, x2, y2], dim=1)
     return box
 
 
