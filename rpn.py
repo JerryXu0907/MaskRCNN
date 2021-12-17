@@ -75,17 +75,8 @@ class RPNHead(torch.nn.Module):
             logit, reg = self.forward_single(X[self.backbone_keys[i]])
             logits.append(logit)
             bbox_regs.append(reg)
-        sorted_clas_list, sorted_coord_list = self.postprocess(logits, bbox_regs, keep_num_postNMS=400)#, keep_preNMS=True)
-        new_coord_list = []
-        for i in range(len(sorted_coord_list)):
-            coords = sorted_coord_list[i]
-            xaya_coords = torch.zeros_like(coords)
-            xaya_coords[..., 0] = coords[..., 0] - coords[..., 2] / 2
-            xaya_coords[..., 1] = coords[..., 1] - coords[..., 3] / 2
-            xaya_coords[..., 2] = coords[..., 0] + coords[..., 2] / 2
-            xaya_coords[..., 3] = coords[..., 1] + coords[..., 3] / 2
-            new_coord_list.append(xaya_coords)
-        return sorted_clas_list, new_coord_list, X
+        sorted_clas_list, sorted_coord_list = self.postprocess(logits, bbox_regs)# xyxy coding
+        return sorted_clas_list, sorted_coord_list, X
 
     # Forward a single level of the FPN output through the intermediate layer and the RPN heads
     # Input:
@@ -299,7 +290,7 @@ class RPNHead(torch.nn.Module):
     #       loss: scalar
     #       loss_c: scalar
     #       loss_r: scalar
-    def compute_loss(self, clas_out_list, regr_out_list, targ_clas_list, targ_regr_list, l=1, effective_batch=50, eval=False):
+    def compute_loss(self, clas_out_list, regr_out_list, targ_clas_list, targ_regr_list, l=1, effective_batch=75, eval=False):
         total_loss, total_loss_c, total_loss_r = 0., 0., 0.
         flat_clas_out = torch.clamp(torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 1) for i in clas_out_list], dim=0), 0, 1)
         flat_regr_out = torch.cat([i.permute(0, 2, 3, 1).reshape(-1, 4) for i in regr_out_list], dim=0)
@@ -339,7 +330,7 @@ class RPNHead(torch.nn.Module):
     # Output:
     #       nms_clas_list: list:len(bz){(Post_NMS_boxes)} (the score of the boxes that the NMS kept)
     #       nms_prebox_list: list:len(bz){(Post_NMS_boxes,4)} (the coordinate of the boxes that the NMS kept)
-    def postprocess(self, out_c, out_r, IOU_thresh=0.5, keep_num_preNMS=3000, keep_num_postNMS=1000, train=True):
+    def postprocess(self, out_c, out_r, IOU_thresh=0.5, keep_num_preNMS=10000, keep_num_postNMS=1000, train=True):
         bz = len(out_c[0])
         _clas_list = []
         _prebox_list = []
@@ -380,9 +371,9 @@ class RPNHead(torch.nn.Module):
         sorted_coord = boxes[sorted_index]
         sorted_clas = sorted_clas[:keep_num_preNMS]
         sorted_coord = sorted_coord[:keep_num_preNMS]
-        ind = torch.nonzero(sorted_clas > 0.6)[:, 0]
-        sorted_clas = sorted_clas[ind]
-        sorted_coord = sorted_coord[ind]
+        # ind = torch.nonzero(sorted_clas > 0.6)[:, 0]
+        # sorted_clas = sorted_clas[ind]
+        # sorted_coord = sorted_coord[ind]
         nms_clas, nms_prebox = self.NMS(sorted_clas, sorted_coord, IOU_thresh)
         nms_clas = nms_clas[:keep_num_postNMS]
         nms_prebox = nms_prebox[:keep_num_postNMS]

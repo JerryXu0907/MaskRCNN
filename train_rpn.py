@@ -69,7 +69,7 @@ def main():
         print("Epoch {} Validation Loss Mean: {:.4f}".format(i, val_loss_mean))
         if i % 5 == 0:
             torch.save(rpn_net.state_dict(), f"./train_result/rpn/rpn_model_{i}.pth")
-        if i > 5:
+        if i > 30:
             if val_loss_mean < best_loss:
                 best_loss = val_loss_mean
                 early_stopping = 0
@@ -137,8 +137,8 @@ def val(model: RPNHead, backbone, loader, i, draw=True):
 
 def plot_NMS(model:RPNHead, data_batch, logits, bbox_regs, epoch, idx):
     logits, bbox_regs = model.postprocess(logits, bbox_regs)
-    bbox_regs[0] = bbox_regs[0][:20]
-    logits[0] = logits[0][:20]
+    bbox_regs[0] = bbox_regs[0][:200]
+    logits[0] = logits[0][:200]
     images = data_batch['img'][0, :, :, :]
     boxes = data_batch['bbox']
     images = transforms.functional.normalize(images,
@@ -151,7 +151,7 @@ def plot_NMS(model:RPNHead, data_batch, logits, bbox_regs, epoch, idx):
         if logits[0][j] > 0.5:
             col = 'b'
             coord = bbox_regs[0][j].cpu().detach().numpy()
-            rect = patches.Rectangle((coord[0] - coord[2] / 2, coord[1] - coord[3] / 2), coord[2], coord[3], fill=False,
+            rect = patches.Rectangle((coord[0], coord[1]), coord[2]-coord[0], coord[3]-coord[1], fill=False,
                                     color=col)
             ax.add_patch(rect)
     for j in range(len(boxes[0])):

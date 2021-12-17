@@ -25,7 +25,7 @@ bboxes_path = './data/hw3_mycocodata_bboxes_comp_zlib.npy'
 paths = [imgs_path, masks_path, bboxes_path, labels_path]
 epoch = 100
 batch_size = 4
-tolerance = 5
+tolerance = 10
 keep_topK = 1000
 torch.manual_seed(17)
 
@@ -109,7 +109,7 @@ def train(model: BoxHead, rpn:RPNHead, loader, optimizer, i):
         # plot(proposals, data_batch)
         fpn_feat_list= [t.detach() for t in list(X.values())]
         feature_vectors = model.MultiScaleRoiAlign(fpn_feat_list, proposals, P=model.P)
-        gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox, iou_thresh=0.5)
+        gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox)
         class_logits, box_pred = model(feature_vectors)
         loss, loss1, loss2 = model.compute_loss(class_logits, box_pred, gt_labels, regressor_target)
         optimizer.zero_grad()
@@ -141,7 +141,7 @@ def val(model: BoxHead, rpn, loader, i):
         gt_labels, regressor_target = model.create_ground_truth(proposals, labels, bbox)
         class_logits, box_pred = model(feature_vectors)
 
-        loss, loss1, loss2 = model.compute_loss(class_logits, box_pred, gt_labels, regressor_target)
+        loss, loss1, loss2 = model.compute_loss(class_logits, box_pred, gt_labels, regressor_target, eval=True)
         loss_t.append(loss.item())
         loss_c.append(loss1.item())
         loss_r.append(loss2.item())

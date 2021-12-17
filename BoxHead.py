@@ -3,10 +3,12 @@ import torch.nn.functional as F
 from torch import nn
 from utils import *
 import torchvision
-
+from dataset import *
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 class BoxHead(torch.nn.Module):
-    def __init__(self, Classes=3, P=14, device="cpu"):
+    def __init__(self, Classes=3, P=7, device="cpu"):
         super(BoxHead, self).__init__()
         self.device = device
         self.C = Classes
@@ -97,60 +99,56 @@ class BoxHead(torch.nn.Module):
             cls = class_logits[start: start + len(proposals[i])]
             reg_box = box_regression[start: start + len(proposals[i])]
             start += len(proposals[i])
+            # get the corresponding category and bounding boxes
+            # remove all the background boxes
+            cls, cate = torch.max(cls, dim=1)
+            nonbg_idx = torch.where(cate > 0)
+            cate = cate[nonbg_idx]
+            cls = cls[nonbg_idx]
+            reg_box = reg_box[nonbg_idx]
+            prop = proposals[i][nonbg_idx]
+            reg_cls_box = torch.zeros(len(cls), 4).cuda()
+            for j in range(len(cls)):
+                reg_cls_box[j] = reg_box[j, 4 * cate[j] - 4: 4 * cate[j]]
+            box = output_decodingd(reg_cls_box, prop)
 
-            # Confidence cutoff
-            non_bg = torch.nonzero(cls[:, 0] < conf_thresh).squeeze(1)
-            cls = cls[non_bg]
-            reg_box = reg_box[non_bg]
-            prop = proposals[i][non_bg]
+            if train:
+                # remove cross boundary boxes
+                inside_idx = torch.where((box[:, 0] >= 0) & (box[:, 1] >= 0) & (box[:, 2] < self.img_size[1]) & (box[:, 3] < self.img_size[0]))
+                box = box[inside_idx]
+                cls = cls[inside_idx]
+                cate = cate[inside_idx]
 
-            # get rid of all background predictions
-            conf, cls = torch.max(cls, dim=1)
-            nonbg_indices = torch.nonzero(cls).squeeze(1)
-            conf = torch.index_select(conf, 0, nonbg_indices)
-            cls = torch.index_select(cls, 0, nonbg_indices) - 1
-            reg_box = torch.index_select(reg_box, 0, nonbg_indices)
-            prop = torch.index_select(prop, 0, nonbg_indices)
+                # keep boxes that has >0.5 iou with gt boxes
+                ious = IOU(box, gt_boxes[i], xaya=True)
+                max_iou, _ = torch.max(ious, dim=1)
 
-            # decode the boxes
-            reg_cls = torch.zeros_like(prop)
-            reg_box = reg_box.reshape(-1, 3, 4)
-            for j in range(len(reg_cls)):
-                reg_cls[j] = reg_box[j, cls[j]]
-            box = output_decodingd(reg_cls, prop)  # x1 y1 x2 y2 type
+                selected_idx = torch.where(max_iou > conf_thresh)
+                cls = cls[selected_idx]
+                box = box[selected_idx]
+                cate = cate[selected_idx]
+            else:
+                # testing crop the cross boundary boxes
+                box[:, 0] = torch.clamp_min(box[:, 0], 0)
+                box[:, 1] = torch.clamp_min(box[:, 1], 0)
+                box[:, 2] = torch.clamp_max(box[:, 2], self.img_size[1])
+                box[:, 3] = torch.clamp_max(box[:, 3], self.img_size[0])
 
-            # Cutoff pre NMS
-            conf = conf[:keep_num_preNMS]
+            # sort boxes according to the confidence scores
+            cls, sorted_idx = torch.sort(cls, descending=True)
+            box = box[sorted_idx][:keep_num_preNMS]
+            cate = cate[sorted_idx][:keep_num_preNMS]
             cls = cls[:keep_num_preNMS]
-            box = box[:keep_num_preNMS]
 
-            left_indices = []
-            for c in range(self.C):
-                indices = torch.nonzero(cls == c).squeeze(1)
-                if len(indices) == 0:
-                    continue
-                box_list = list(range(len(indices)))
-                left_index = []
-                while len(box_list) > 0:
-                    l = box_list[0]
-                    remove_list = [l]
-                    for b in range(1, len(box_list)):
-                        iou = single_IOU(box[indices[l]], box[indices[box_list[b]]], True, True)
-                        if iou > IOU_thresh:
-                            remove_list.append(box_list[b])
-                    for r in remove_list:
-                        box_list.remove(r)
-                    left_index.append(l)
-                left_indices.append(indices[left_index])
-            if len(left_indices) == 0:
-                return [], [], []
-            left_indices, _ = torch.sort(torch.cat(left_indices))
-            conf = (conf[left_indices])[:keep_num_postNMS]
-            cls = (cls[left_indices])[:keep_num_postNMS]
-            box = (box[left_indices])[:keep_num_postNMS]
+            # nms for different classes
+            nms_indices = torchvision.ops.batched_nms(box, cls, cate, conf_thresh)
+            box = box[nms_indices][:keep_num_postNMS]
+            cate = cate[nms_indices][:keep_num_postNMS]
+            cls = cls[nms_indices][:keep_num_postNMS]
+
             boxes.append(box)
-            scores.append(conf)
-            labels.append(cls)
+            scores.append(cls)
+            labels.append(cate)
         return boxes, scores, labels
 
     # Compute the total loss of the classifier and the regressor
@@ -165,33 +163,44 @@ class BoxHead(torch.nn.Module):
     #      loss: scalar
     #      loss_class: scalar
     #      loss_regr: scalar
-    def compute_loss(self,class_logits, box_preds, labels, regression_targets,l=1,effective_batch=150):
+    def compute_loss(self,class_logits, box_preds, labels, regression_targets,l=1,effective_batch=150, eval=False):
         class_criterion = nn.CrossEntropyLoss(reduction='sum')
         regr_criterion = nn.SmoothL1Loss(reduction='sum')
 
         bg_labels_idx = torch.nonzero(labels==0)[:, 0]
         nonbg_labels_idx = torch.nonzero(labels!=0)[:, 0]
-        max_nonbg_sample_size = int(0.75*effective_batch)
-        nonbg_sample_size = min(len(nonbg_labels_idx), max_nonbg_sample_size)
-        bg_sample_size = effective_batch - nonbg_sample_size
+        # print(len(nonbg_labels_idx))
+        if not eval:
+            max_nonbg_sample_size = int(0.75*effective_batch)
+            nonbg_sample_size = min(len(nonbg_labels_idx), max_nonbg_sample_size)
+            bg_sample_size = effective_batch - nonbg_sample_size
 
-        bg_sample_idx = bg_labels_idx[torch.randperm(len(bg_labels_idx))[:bg_sample_size]]
-        nonbg_sample_idx = nonbg_labels_idx[torch.randperm(len(nonbg_labels_idx))[:nonbg_sample_size]]
-        loss_class = class_criterion(
-                    class_logits[torch.hstack([bg_sample_idx, nonbg_sample_idx])],
-                    labels[torch.hstack([bg_sample_idx, nonbg_sample_idx])].squeeze(1))
-        
-        lab = labels[nonbg_sample_idx] - 1
-        preds = torch.zeros_like(regression_targets[nonbg_sample_idx])
-        t_preds = box_preds[nonbg_sample_idx].reshape(-1, 3, 4)
-        for i in range(len(preds)):
-            preds[i] = t_preds[i][lab[i]]
-        loss_regr = regr_criterion(preds, regression_targets[nonbg_sample_idx])
-
-        loss_class = loss_class / effective_batch
-        loss_regr = loss_regr / effective_batch
-        loss = loss_class + l*loss_regr
-
+            bg_sample_idx = bg_labels_idx[torch.randperm(len(bg_labels_idx))[:bg_sample_size]]
+            nonbg_sample_idx = nonbg_labels_idx[torch.randperm(len(nonbg_labels_idx))[:nonbg_sample_size]]
+            loss_class = class_criterion(
+                        class_logits[torch.hstack([bg_sample_idx, nonbg_sample_idx])],
+                        labels[torch.hstack([bg_sample_idx, nonbg_sample_idx])].squeeze(1))
+            
+            lab = labels[nonbg_sample_idx] - 1
+            preds = torch.zeros_like(regression_targets[nonbg_sample_idx])
+            t_preds = box_preds[nonbg_sample_idx].reshape(-1, 3, 4)
+            for i in range(len(preds)):
+                preds[i] = t_preds[i][lab[i]]
+            loss_regr = regr_criterion(preds, regression_targets[nonbg_sample_idx])
+            loss_class = loss_class / effective_batch
+            loss_regr = loss_regr / nonbg_sample_size
+            loss = loss_class + l*loss_regr
+        else:
+            loss_class = class_criterion(class_logits, labels.squeeze(1))
+            lab = labels[nonbg_labels_idx] - 1
+            preds = torch.zeros_like(regression_targets[nonbg_labels_idx])
+            t_preds = box_preds[nonbg_labels_idx].reshape(-1, 3, 4)
+            for i in range(len(preds)):
+                preds[i] = t_preds[i][lab[i]]
+            loss_regr = regr_criterion(preds, regression_targets[nonbg_labels_idx])
+            loss_class /= len(class_logits)
+            loss_regr /= len(nonbg_labels_idx)
+            loss = loss_class + l*loss_regr
         return loss, loss_class, loss_regr
 
     # Forward the pooled feature vectors through the intermediate layer and the classifier, regressor of the box head
@@ -242,48 +251,6 @@ class BoxHead(torch.nn.Module):
         assert feature_vectors.shape[1] == 256 * P * P
         assert len(feature_vectors.shape) == 2
         return feature_vectors.cuda()
-
-    def preNMS(self, class_logits, box_regression, proposals, conf_thresh=0.5, keep_num_preNMS=500, keep_num_postNMS=50,
-               IOU_thresh=0.5):
-        b = len(proposals)
-        boxes = []
-        scores = []
-        labels = []
-        start = 0
-        for i in range(b):
-            cls = class_logits[start: start + len(proposals[i])]
-            reg_box = box_regression[start: start + len(proposals[i])]
-            start += len(proposals[i])
-
-            # Confidence cutoff
-            non_bg = torch.nonzero(cls[:, 0] < conf_thresh).squeeze(1)
-            cls = cls[non_bg]
-            reg_box = reg_box[non_bg]
-            prop = proposals[i][non_bg]
-
-            # get rid of all background predictions
-            conf, cls = torch.max(cls, dim=1)
-            nonbg_indices = torch.nonzero(cls).squeeze(1)
-            conf = torch.index_select(conf, 0, nonbg_indices)
-            cls = torch.index_select(cls, 0, nonbg_indices) - 1
-            reg_box = torch.index_select(reg_box, 0, nonbg_indices)
-            prop = torch.index_select(prop, 0, nonbg_indices)
-
-            # decode the boxes
-            reg_cls = torch.zeros_like(prop)
-            reg_box = reg_box.reshape(-1, 3, 4)
-            for j in range(len(reg_cls)):
-                reg_cls[j] = reg_box[j, cls[j]]
-            box = output_decodingd(reg_cls, prop)  # x1 y1 x2 y2 type
-
-            # Cutoff pre NMS
-            conf = conf[:20]
-            cls = cls[:20]
-            box = box[:20]
-            boxes.append(box)
-            scores.append(conf)
-            labels.append(cls)
-        return boxes, scores, labels
 
     def MultiScaleRoiAlign_mask(self, fpn_feat_list, proposals, P=14):
         b = len(proposals)
@@ -338,3 +305,70 @@ class BoxHead(torch.nn.Module):
             new_box[:, 3] = torch.min(box[:, 3], 800 * torch.ones((1, len(box))).to(self.device))
             boxes.append(new_box)
         return boxes
+
+def plot_result():
+    imgs_path = './data/hw3_mycocodata_img_comp_zlib.h5'
+    masks_path = './data/hw3_mycocodata_mask_comp_zlib.h5'
+    labels_path = './data/hw3_mycocodata_labels_comp_zlib.npy'
+    bboxes_path = './data/hw3_mycocodata_bboxes_comp_zlib.npy'
+    paths = [imgs_path, masks_path, bboxes_path, labels_path]
+
+    dataset = BuildDataset(paths)
+    full_size = len(dataset)
+    train_size = int(full_size * 0.8)
+    test_size = full_size - train_size
+    # random split the dataset into training and testset
+    print("Data Loading")
+    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+    test_build_loader = BuildDataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=4)
+    test_loader = test_build_loader.loader()
+    device="cuda:0"
+    rcnn_net = BoxHead(device=device)
+    rpn = RPNHead(device=device)
+    rpn.load_state_dict(torch.load("./train_result/rpn/rpn_best_model.pth"))
+    rpn.eval()
+
+    rcnn_net.load_state_dict(torch.load("./train_result/boxhead_rpn_nms/boxhead_best_model.pth"))
+    rcnn_net.eval()
+    for idx, data_batch in enumerate(test_loader):
+        images = data_batch['img'].to(device)
+        bbox = data_batch["bbox"]
+        labels = data_batch["labels"]
+        bbox = [b.cuda() for b in bbox]
+        labels = [l.cuda() for l in labels]
+        _, new_coord_list, X = rpn.forward_test(images)
+        proposals=[proposal[0:1000,:].detach() for proposal in new_coord_list]
+        # plot(proposals, data_batch)
+        fpn_feat_list= [t.detach() for t in list(X.values())]
+        feature_vectors = rcnn_net.MultiScaleRoiAlign(fpn_feat_list, proposals, P=rcnn_net.P)
+        class_logits, box_pred = rcnn_net(feature_vectors, eval=True)
+        boxes, scores, labels = rcnn_net.postprocess_detections(class_logits, box_pred, proposals)
+
+        img = images[0, :, :, :].cpu()
+        img = transforms.functional.normalize(img, [-0.485 / 0.229, -0.456 / 0.224, -0.406 / 0.225],
+                                                 [1 / 0.229, 1 / 0.224, 1 / 0.225], inplace=False)
+        fig, ax = plt.subplots(1, 1)
+        ax.imshow(img.permute(1, 2, 0))
+
+        boxes = boxes[0].cpu().detach().numpy()
+        col = ["y", "g", "b"]
+        for i in range(len(boxes)):
+            b = boxes[i]
+            rect = patches.Rectangle((b[0], b[1]), b[2]-b[0], b[3] - b[1], fill=False,
+                                        color=col[labels[0][i] - 1])
+            ax.add_patch(rect)
+        
+        for b in bbox[0]:
+            b = b.cpu().detach().numpy()
+            col = "r"
+            rect = patches.Rectangle((b[0] - b[2]/2, b[1] - b[3]/2), b[2], b[3], fill=False,
+                                        color=col)
+            ax.add_patch(rect)
+
+        plt.savefig(f"./predict_vis/boxhead/postNMS/{idx}.png")
+        plt.close()
+        if idx > 20:
+            break
+
+if __name__ == "__main__":
+    plot_result()
